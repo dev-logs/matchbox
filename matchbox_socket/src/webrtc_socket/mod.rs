@@ -19,6 +19,7 @@ pub use socket::{
     ChannelConfig, PeerState, RtcIceServerConfig, WebRtcChannel, WebRtcSocket, WebRtcSocketBuilder,
 };
 use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
+use crate::webrtc_socket::error::PeerError;
 
 cfg_if! {
     if #[cfg(target_arch = "wasm32")] {
@@ -102,7 +103,7 @@ async fn signaling_loop(
             message = signaller.next_message().fuse() => {
                 match message {
                     Ok(message) => {
-                        debug!("Received {message:?}");
+                        debug!("Received signaling event {message:?}");
                         events_sender.unbounded_send(message).map_err(SignalingError::from)?;
                     }
                     Err(SignalingError::UnknownFormat) => {
@@ -150,11 +151,12 @@ trait Messenger {
 
     async fn offer_handshake(
         signal_peer: SignalPeer,
-        mut peer_signal_rx: UnboundedReceiver<PeerSignal>,
+        peer_signal_rx: UnboundedReceiver<PeerSignal>,
         messages_from_peers_tx: Vec<UnboundedSender<(PeerId, Packet)>>,
         ice_server_config: &RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
-    ) -> HandshakeResult<Self::DataChannel, Self::HandshakeMeta>;
+        timeout: Duration,
+    ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError>;
 
     async fn accept_handshake(
         signal_peer: SignalPeer,
@@ -162,7 +164,8 @@ trait Messenger {
         messages_from_peers_tx: Vec<UnboundedSender<(PeerId, Packet)>>,
         ice_server_config: &RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
-    ) -> HandshakeResult<Self::DataChannel, Self::HandshakeMeta>;
+        timeout: Duration,
+    ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError>;
 
     async fn peer_loop(peer_uuid: PeerId, handshake_meta: Self::HandshakeMeta) -> PeerId;
 }
@@ -173,6 +176,7 @@ async fn message_loop<M: Messenger>(
     channel_configs: &[ChannelConfig],
     channels: MessageLoopChannels,
     keep_alive_interval: Option<Duration>,
+    handshake_timeout: Duration,
 ) -> Result<(), SignalingError> {
     let MessageLoopChannels {
         requests_sender,
@@ -231,11 +235,12 @@ async fn message_loop<M: Messenger>(
                             let (signal_tx, signal_rx) = futures_channel::mpsc::unbounded();
                             handshake_signals.insert(peer_uuid, signal_tx);
                             let signal_peer = SignalPeer::new(peer_uuid, requests_sender.clone());
-                            handshakes.push(M::offer_handshake(signal_peer, signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs))
+                            handshakes.push(M::offer_handshake(signal_peer, signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs, handshake_timeout.clone()))
                         },
                         PeerEvent::PeerLeft(peer_uuid) => {
                             if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected, PeerBuffered::default())).is_err() {
                                 // socket dropped, exit cleanly
+                                warn!("Stop message loop because failed to send peer left event to peer {peer_uuid} (socket dropped)");
                                 break Ok(());
                             }
                         },
@@ -243,7 +248,7 @@ async fn message_loop<M: Messenger>(
                             let signal_tx = handshake_signals.entry(sender).or_insert_with(|| {
                                 let (from_peer_tx, peer_signal_rx) = futures_channel::mpsc::unbounded();
                                 let signal_peer = SignalPeer::new(sender, requests_sender.clone());
-                                handshakes.push(M::accept_handshake(signal_peer, peer_signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs));
+                                handshakes.push(M::accept_handshake(signal_peer, peer_signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs, handshake_timeout.clone()));
                                 from_peer_tx
                             });
 
@@ -256,6 +261,19 @@ async fn message_loop<M: Messenger>(
             }
 
             handshake_result = handshakes.select_next_some() => {
+                 let handshake_result = match handshake_result {
+                    Ok(handshake_result) => handshake_result,
+                    Err(peer_error) => {
+                        warn!("error during handshake: {peer_error:?}");
+                        if peer_state_tx.unbounded_send((peer_error.0, PeerState::Disconnected, PeerBuffered::default())).is_err() {
+                            // socket dropped, exit cleanly
+                            break Ok(());
+                        }
+
+                        continue;
+                    }
+                };
+
                 data_channels.insert(handshake_result.peer_id, handshake_result.data_channels);
                 if peer_state_tx.unbounded_send((handshake_result.peer_id, PeerState::Connected, handshake_result.peer_buffered.clone())).is_err() {
                     // sending can only fail on socket drop, in which case connected_peers is unavailable, ignore
