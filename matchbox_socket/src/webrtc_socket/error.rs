@@ -24,7 +24,7 @@ pub enum ChannelError {
 }
 
 #[derive(Debug)]
-pub struct PeerError(pub PeerId, pub(crate) SignalingError);
+pub struct PeerError(pub PeerId, pub SignalingError);
 
 impl PeerError {
     /// Returns the signalling error

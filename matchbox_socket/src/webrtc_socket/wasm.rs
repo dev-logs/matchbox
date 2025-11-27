@@ -408,6 +408,7 @@ async fn complete_handshake(
     // select for data channels ready or ice candidates
     debug!("waiting for data channels to open");
     let mut delay = Delay::new(timeout).fuse();
+    let mut err = None;
     loop {
         select! {
             _ = data_channels_ready_fut => {
@@ -421,7 +422,7 @@ async fn complete_handshake(
             }
             _ = delay => {
                 warn!("timeout waiting for data channels to open");
-                return Err(PeerError(peer_id, SignalingError::HandshakeFailed));
+                err.replace(Err(PeerError(peer_id, SignalingError::HandshakeFailed)));
             }
         };
     }
@@ -443,7 +444,7 @@ async fn complete_handshake(
         conn.ice_gathering_state()
     );
 
-    Ok(())
+    err.unwrap_or(Ok(()))
 }
 
 async fn try_add_rtc_ice_candidate(connection: &RtcPeerConnection, candidate_string: &str) {
@@ -530,14 +531,15 @@ async fn wait_for_ice_gathering_complete(peer_id: PeerId, conn: RtcPeerConnectio
     select! {
         _ = delay => {
             warn!("timeout waiting for ice gathering to complete");
+            conn.set_onicegatheringstatechange(None);
             return Err(PeerError(peer_id, SignalingError::HandshakeFailed));
         },
         _ = rx.next() => {
+            info!("Ice gathering completed");
         }
     }
 
     conn.set_onicegatheringstatechange(None);
-    debug!("Ice gathering completed");
 
     Ok(())
 }
