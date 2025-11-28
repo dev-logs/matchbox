@@ -19,6 +19,7 @@ pub use socket::{
     ChannelConfig, PeerState, RtcIceServerConfig, WebRtcChannel, WebRtcSocket, WebRtcSocketBuilder,
 };
 use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
+use crate::SignalingError::UserImplementationError;
 use crate::webrtc_socket::error::PeerError;
 
 cfg_if! {
@@ -294,10 +295,12 @@ async fn message_loop<M: Messenger>(
             message = next_peer_message_out => {
                 match message {
                     Some((channel_index, Some((peer, packet)))) => {
-                        let data_channel = data_channels
+                        let Some(data_channel) = data_channels
                             .get_mut(&peer)
-                            .expect("couldn't find data channel for peer")
-                            .get_mut(channel_index).unwrap_or_else(|| panic!("couldn't find data channel with index {channel_index}"));
+                            .and_then(|it| it.get_mut(channel_index)) else {
+                            break Err(SignalingError::UserImplementationError("Channel not found".to_string()));
+                        };
+
                         if let Err(e) = data_channel.send(packet) {
                             // Peer we're sending to closed their end of the connection.
                             // We anticipate the PeerLeft event soon, but we sent a message before it came.
