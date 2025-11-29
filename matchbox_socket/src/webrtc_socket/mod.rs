@@ -244,6 +244,8 @@ async fn message_loop<M: Messenger>(
                                 warn!("Stop message loop because failed to send peer left event to peer {peer_uuid} (socket dropped)");
                                 break Ok(());
                             }
+
+                            handshake_signals.remove(&peer_uuid);
                         },
                         PeerEvent::Signal { sender, data } => {
                             let signal_tx = handshake_signals.entry(sender).or_insert_with(|| {
@@ -253,8 +255,8 @@ async fn message_loop<M: Messenger>(
                                 from_peer_tx
                             });
 
-                            if signal_tx.unbounded_send(data).is_err() {
-                                warn!("ignoring signal from peer {sender} because the handshake has already finished");
+                            if let Err(e) = signal_tx.unbounded_send(data) {
+                                warn!("ignoring signal from peer {sender} because the handshake has already finished {e:?}");
                             }
                         },
                     }
