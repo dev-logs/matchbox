@@ -145,7 +145,7 @@ impl Messenger for WasmMessenger {
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
         debug!("making offer");
 
-        let conn = create_rtc_peer_connection(ice_server_config);
+        let conn = create_rtc_peer_connection(&signal_peer.id, ice_server_config)?;
 
         let (data_channel_ready_txs, data_channels_ready_fut) =
             create_data_channels_ready_fut(channel_configs);
@@ -252,7 +252,7 @@ impl Messenger for WasmMessenger {
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
         debug!("handshake_accept");
 
-        let conn = create_rtc_peer_connection(ice_server_config);
+        let conn = create_rtc_peer_connection(&signal_peer.id, ice_server_config)?;
 
         let (data_channel_ready_txs, data_channels_ready_fut) =
             create_data_channels_ready_fut(channel_configs);
@@ -472,7 +472,7 @@ async fn try_add_rtc_ice_candidate(connection: &RtcPeerConnection, candidate_str
     .expect("failed to add ice candidate");
 }
 
-fn create_rtc_peer_connection(ice_server_config: &RtcIceServerConfig) -> RtcPeerConnection {
+fn create_rtc_peer_connection(peer_id: &PeerId, ice_server_config: &RtcIceServerConfig) -> Result<RtcPeerConnection, PeerError> {
     #[derive(Serialize)]
     struct IceServerConfig {
         urls: Vec<String>,
@@ -488,7 +488,7 @@ fn create_rtc_peer_connection(ice_server_config: &RtcIceServerConfig) -> RtcPeer
     };
     let ice_server_config_list = [ice_server_config];
     peer_config.set_ice_servers(&serde_wasm_bindgen::to_value(&ice_server_config_list).unwrap());
-    let connection = RtcPeerConnection::new_with_configuration(&peer_config).unwrap();
+    let connection = RtcPeerConnection::new_with_configuration(&peer_config).map_err(|it| PeerError(peer_id.clone(), SignalingError::UserImplementationError(format!("{it:?}"))))?;
 
     let connection_1 = connection.clone();
     let oniceconnectionstatechange: Box<dyn FnMut(_)> = Box::new(move |_event: JsValue| {
@@ -504,7 +504,7 @@ fn create_rtc_peer_connection(ice_server_config: &RtcIceServerConfig) -> RtcPeer
         .set_oniceconnectionstatechange(Some(oniceconnectionstatechange.as_ref().unchecked_ref()));
     oniceconnectionstatechange.forget();
 
-    connection
+    Ok(connection)
 }
 
 async fn wait_for_ice_gathering_complete(peer_id: PeerId, conn: RtcPeerConnection, timeout: Duration) -> Result<(), PeerError> {
