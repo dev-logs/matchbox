@@ -15,6 +15,7 @@ use matchbox_protocol::PeerId;
 use serde::Serialize;
 use std::{pin::Pin, time::Duration};
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 use wasm_bindgen::{JsCast, JsValue, convert::FromWasmAbi, prelude::*};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -29,8 +30,32 @@ pub(crate) struct WasmSignaller {
     websocket_stream: futures::stream::Fuse<WsStream>,
 }
 
-#[derive(Debug, Clone)]
 pub struct RtcDataChannelWrapper(pub(crate) RtcDataChannel);
+
+pub struct RtcConnectionWrapper(pub(crate) RtcPeerConnection);
+
+impl RtcDataChannelWrapper {
+    fn new(data_channel: RtcDataChannel) -> Arc<Self> {
+        Arc::new(Self(data_channel))
+    }
+}
+
+unsafe impl Sync for RtcConnectionWrapper {}
+
+impl Deref for RtcConnectionWrapper {
+    type Target = RtcPeerConnection;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl RtcConnectionWrapper {
+    fn new(conn: RtcPeerConnection) -> Arc<Self> {
+        Arc::new(Self(conn))
+    }
+}
+
+unsafe impl Send for RtcConnectionWrapper {}
 
 unsafe impl Send for RtcDataChannelWrapper {}
 
@@ -46,6 +71,20 @@ impl Deref for RtcDataChannelWrapper {
 impl DerefMut for RtcDataChannelWrapper {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+impl Drop for RtcDataChannelWrapper {
+    fn drop(&mut self) {
+        log::info!("closing data channel on drop");
+        self.0.close()
+    }
+}
+
+impl Drop for RtcConnectionWrapper {
+    fn drop(&mut self) {
+        log::info!("closing peer connection on drop");
+        self.0.close();
     }
 }
 
@@ -113,16 +152,24 @@ impl Signaller for WasmSignaller {
     }
 }
 
-impl PeerDataSender for RtcDataChannelWrapper {
+#[async_trait(?Send)]
+impl PeerDataSender for Arc<RtcDataChannelWrapper> {
     fn send(&mut self, packet: Packet) -> Result<(), PacketSendError> {
         self.send_with_u8_array(&packet)
             .efix()
             .map_err(|source| PacketSendError { source })
     }
+
+    async fn close(&mut self) -> Result<(), PacketSendError> {
+        info!("closing data channel");
+        self.0.close();
+
+        Ok(())
+    }
 }
 
 #[async_trait(?Send)]
-impl BufferedChannel for RtcDataChannelWrapper {
+impl BufferedChannel for Arc<RtcDataChannelWrapper> {
     async fn buffered_amount(&self) -> usize {
         self.0.buffered_amount() as usize
     }
@@ -132,8 +179,8 @@ pub(crate) struct WasmMessenger;
 
 #[async_trait(?Send)]
 impl Messenger for WasmMessenger {
-    type DataChannel = RtcDataChannelWrapper;
-    type HandshakeMeta = Receiver<()>;
+    type DataChannel = Arc<RtcDataChannelWrapper>;
+    type HandshakeMeta = (Receiver<()>, Arc<RtcConnectionWrapper>);
 
     async fn offer_handshake(
         signal_peer: SignalPeer,
@@ -181,11 +228,10 @@ impl Messenger for WasmMessenger {
             .unwrap();
         debug!("created offer for new peer");
 
-        // todo: the point of implementing ice trickle is to avoid this wait...
-        // however, for some reason removing this wait causes problems with NAT
-        // punching in practice.
-        // We should figure out why this is happening.
-        wait_for_ice_gathering_complete(signal_peer.id.clone(), conn.clone(), timeout.clone()).await?;
+        // After some investigation, the full trickle on web could causing
+        // issues of overloading, we should implement the half-trickle instead.
+        // todo: implement the half trickle
+       wait_for_ice_gathering_complete(signal_peer.id.clone(), conn.clone(), timeout.clone()).await?;
 
         signal_peer.send(PeerSignal::Offer(conn.local_description().unwrap().sdp()));
 
@@ -226,7 +272,7 @@ impl Messenger for WasmMessenger {
 
         complete_handshake(
             signal_peer.clone(),
-            conn,
+            conn.clone(),
             received_candidates,
             data_channels_ready_fut,
             peer_signal_rx,
@@ -237,7 +283,7 @@ impl Messenger for WasmMessenger {
         Ok(HandshakeResult {
             peer_id: signal_peer.id,
             data_channels,
-            metadata: peer_disconnected_rx,
+            metadata: (peer_disconnected_rx, conn),
             peer_buffered,
         })
     }
@@ -332,10 +378,8 @@ impl Messenger for WasmMessenger {
             .efix()
             .unwrap();
 
-        // todo: the point of implementing ice trickle is to avoid this wait...
-        // however, for some reason removing this wait causes problems with NAT
-        // punching in practice.
-        // We should figure out why this is happening.
+        // todo: implement the full trickle on accept handshake side
+        // the offer side will be gathering all ice before sent, and answer side will use full trickle
         wait_for_ice_gathering_complete(signal_peer.id.clone(), conn.clone(), timeout.clone()).await?;
 
         let answer = PeerSignal::Answer(conn.local_description().unwrap().sdp());
@@ -343,7 +387,7 @@ impl Messenger for WasmMessenger {
 
         complete_handshake(
             signal_peer.clone(),
-            conn,
+            conn.clone(),
             received_candidates,
             data_channels_ready_fut,
             peer_signal_rx,
@@ -354,21 +398,23 @@ impl Messenger for WasmMessenger {
         Ok(HandshakeResult {
             peer_id: signal_peer.id,
             data_channels,
-            metadata: peer_disconnected_rx,
+            metadata: (peer_disconnected_rx, conn),
             peer_buffered,
         })
     }
 
     async fn peer_loop(peer_uuid: PeerId, handshake_meta: Self::HandshakeMeta) -> PeerId {
-        let mut peer_loop_finished_rx = handshake_meta;
+        let (mut peer_loop_finished_rx, conn) = handshake_meta;
         peer_loop_finished_rx.next().await;
+        log::info!("peer loop finished for peer {}", peer_uuid);
+        conn.close();
         peer_uuid
     }
 }
 
 async fn complete_handshake(
     signal_peer: SignalPeer,
-    conn: RtcPeerConnection,
+    conn: Arc<RtcConnectionWrapper>,
     received_candidates: Vec<String>,
     mut data_channels_ready_fut: Pin<Box<futures::future::Fuse<impl Future<Output = ()>>>>,
     mut peer_signal_rx: UnboundedReceiver<PeerSignal>,
@@ -472,7 +518,7 @@ async fn try_add_rtc_ice_candidate(connection: &RtcPeerConnection, candidate_str
     .expect("failed to add ice candidate");
 }
 
-fn create_rtc_peer_connection(peer_id: &PeerId, ice_server_config: &RtcIceServerConfig) -> Result<RtcPeerConnection, PeerError> {
+fn create_rtc_peer_connection(peer_id: &PeerId, ice_server_config: &RtcIceServerConfig) -> Result<Arc<RtcConnectionWrapper>, PeerError> {
     #[derive(Serialize)]
     struct IceServerConfig {
         urls: Vec<String>,
@@ -488,7 +534,7 @@ fn create_rtc_peer_connection(peer_id: &PeerId, ice_server_config: &RtcIceServer
     };
     let ice_server_config_list = [ice_server_config];
     peer_config.set_ice_servers(&serde_wasm_bindgen::to_value(&ice_server_config_list).unwrap());
-    let connection = RtcPeerConnection::new_with_configuration(&peer_config).map_err(|it| PeerError(peer_id.clone(), SignalingError::UserImplementationError(format!("{it:?}"))))?;
+    let connection = RtcConnectionWrapper::new(RtcPeerConnection::new_with_configuration(&peer_config).map_err(|it| PeerError(peer_id.clone(), SignalingError::UserImplementationError(format!("{it:?}"))))?);
 
     let connection_1 = connection.clone();
     let oniceconnectionstatechange: Box<dyn FnMut(_)> = Box::new(move |_event: JsValue| {
@@ -507,7 +553,7 @@ fn create_rtc_peer_connection(peer_id: &PeerId, ice_server_config: &RtcIceServer
     Ok(connection)
 }
 
-async fn wait_for_ice_gathering_complete(peer_id: PeerId, conn: RtcPeerConnection, timeout: Duration) -> Result<(), PeerError> {
+async fn wait_for_ice_gathering_complete(peer_id: PeerId, conn: Arc<RtcConnectionWrapper>, timeout: Duration) -> Result<(), PeerError> {
     if conn.ice_gathering_state() == RtcIceGatheringState::Complete {
         debug!("Ice gathering already completed");
         return Ok(());
@@ -545,13 +591,13 @@ async fn wait_for_ice_gathering_complete(peer_id: PeerId, conn: RtcPeerConnectio
 }
 
 fn create_data_channels(
-    connection: RtcPeerConnection,
+    connection: Arc<RtcConnectionWrapper>,
     mut incoming_tx: Vec<futures_channel::mpsc::UnboundedSender<(PeerId, Packet)>>,
     peer_id: PeerId,
     peer_disconnected_tx: futures_channel::mpsc::Sender<()>,
     mut data_channel_ready_txs: Vec<futures_channel::mpsc::Sender<()>>,
     channel_config: &[ChannelConfig],
-) -> Vec<RtcDataChannelWrapper> {
+) -> Vec<Arc<RtcDataChannelWrapper>> {
     channel_config
         .iter()
         .enumerate()
@@ -570,21 +616,21 @@ fn create_data_channels(
 }
 
 fn create_data_channel(
-    connection: RtcPeerConnection,
+    connection: Arc<RtcConnectionWrapper>,
     incoming_tx: futures_channel::mpsc::UnboundedSender<(PeerId, Packet)>,
     peer_id: PeerId,
     peer_disconnected_tx: futures_channel::mpsc::Sender<()>,
     mut channel_open: futures_channel::mpsc::Sender<()>,
     channel_config: &ChannelConfig,
     channel_id: usize,
-) -> RtcDataChannelWrapper {
+) -> Arc<RtcDataChannelWrapper> {
     let data_channel_config = data_channel_config(channel_config);
     data_channel_config.set_id(channel_id as u16);
 
-    let channel = connection.create_data_channel_with_data_channel_dict(
+    let channel = RtcDataChannelWrapper::new(connection.create_data_channel_with_data_channel_dict(
         &format!("matchbox_socket_{channel_id}"),
         &data_channel_config,
-    );
+    ));
 
     channel.set_binary_type(RtcDataChannelType::Arraybuffer);
 
@@ -643,7 +689,7 @@ fn create_data_channel(
         },
     );
 
-    RtcDataChannelWrapper(channel)
+    channel
 }
 
 /// Note that this function leaks some memory because the rust closure is dropped but still needs to

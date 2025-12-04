@@ -19,7 +19,6 @@ pub use socket::{
     ChannelConfig, PeerState, RtcIceServerConfig, WebRtcChannel, WebRtcSocket, WebRtcSocketBuilder,
 };
 use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
-use crate::SignalingError::UserImplementationError;
 use crate::webrtc_socket::error::PeerError;
 
 cfg_if! {
@@ -133,8 +132,12 @@ struct PacketSendError {
     source: error::JsError,
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 trait PeerDataSender {
     fn send(&mut self, packet: Packet) -> Result<(), PacketSendError>;
+
+    async fn close(&mut self) -> Result<(), PacketSendError>;
 }
 
 struct HandshakeResult<D: PeerDataSender, M> {
@@ -245,6 +248,7 @@ async fn message_loop<M: Messenger>(
                                 break Ok(());
                             }
 
+                            data_channels.remove(&peer_uuid);
                             handshake_signals.remove(&peer_uuid);
                         },
                         PeerEvent::Signal { sender, data } => {
@@ -266,9 +270,11 @@ async fn message_loop<M: Messenger>(
             handshake_result = handshakes.select_next_some() => {
                  let handshake_result = match handshake_result {
                     Ok(handshake_result) => handshake_result,
-                    Err(peer_error) => {
-                        warn!("error during handshake: {peer_error:?}");
-                        if peer_state_tx.unbounded_send((peer_error.0, PeerState::Disconnected, PeerBuffered::default())).is_err() {
+                    Err(PeerError(peer_id, error)) => {
+                        warn!("error during handshake for peer {peer_id}: {error:?}");
+
+                        data_channels.remove(&peer_id);
+                        if peer_state_tx.unbounded_send((peer_id, PeerState::Disconnected, PeerBuffered::default())).is_err() {
                             // socket dropped, exit cleanly
                             break Ok(());
                         }
@@ -292,6 +298,7 @@ async fn message_loop<M: Messenger>(
                     // sending can only fail on socket drop, in which case connected_peers is unavailable, ignore
                     break Ok(());
                 }
+                data_channels.remove(&peer_uuid);
             }
 
             message = next_peer_message_out => {
@@ -300,7 +307,8 @@ async fn message_loop<M: Messenger>(
                         let Some(data_channel) = data_channels
                             .get_mut(&peer)
                             .and_then(|it| it.get_mut(channel_index)) else {
-                            break Err(SignalingError::UserImplementationError("Channel not found".to_string()));
+                            log::warn!("received message for unknown peer {peer}");
+                            continue;
                         };
 
                         if let Err(e) = data_channel.send(packet) {
