@@ -2,6 +2,7 @@ pub mod error;
 mod messages;
 mod signal_peer;
 mod socket;
+mod batch;
 
 use self::error::SignalingError;
 use crate::{Error, webrtc_socket::signal_peer::SignalPeer};
@@ -19,7 +20,11 @@ pub use socket::{
     ChannelConfig, PeerState, RtcIceServerConfig, WebRtcChannel, WebRtcSocket, WebRtcSocketBuilder,
 };
 use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
+use std::usize::MAX;
+use crate::webrtc_socket::batch::Batch;
 use crate::webrtc_socket::error::PeerError;
+
+pub static MAX_PACKET_SIZE: usize = 1024 * 64;
 
 cfg_if! {
     if #[cfg(target_arch = "wasm32")] {
@@ -201,7 +206,7 @@ async fn message_loop<M: Messenger>(
     } else {
         Either::Right(std::future::pending())
     }
-    .fuse();
+        .fuse();
 
     loop {
         let mut next_peer_messages_out = peer_messages_out_rx
@@ -242,7 +247,7 @@ async fn message_loop<M: Messenger>(
                             handshakes.push(M::offer_handshake(signal_peer, signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs, handshake_timeout.clone()))
                         },
                         PeerEvent::PeerLeft(peer_uuid) => {
-                            if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected, PeerBuffered::default())).is_err() {
+                            if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected, None)).is_err() {
                                 // socket dropped, exit cleanly
                                 warn!("Stop message loop because failed to send peer left event to peer {peer_uuid} (socket dropped)");
                                 break Ok(());
@@ -274,7 +279,7 @@ async fn message_loop<M: Messenger>(
                         warn!("error during handshake for peer {peer_id}: {error:?}");
 
                         data_channels.remove(&peer_id);
-                        if peer_state_tx.unbounded_send((peer_id, PeerState::Disconnected, PeerBuffered::default())).is_err() {
+                        if peer_state_tx.unbounded_send((peer_id, PeerState::Disconnected, None)).is_err() {
                             // socket dropped, exit cleanly
                             break Ok(());
                         }
@@ -284,7 +289,7 @@ async fn message_loop<M: Messenger>(
                 };
 
                 data_channels.insert(handshake_result.peer_id, handshake_result.data_channels);
-                if peer_state_tx.unbounded_send((handshake_result.peer_id, PeerState::Connected, handshake_result.peer_buffered.clone())).is_err() {
+                if peer_state_tx.unbounded_send((handshake_result.peer_id, PeerState::Connected, Some(handshake_result.peer_buffered.clone()))).is_err() {
                     // sending can only fail on socket drop, in which case connected_peers is unavailable, ignore
                     break Ok(());
                 }
@@ -294,10 +299,11 @@ async fn message_loop<M: Messenger>(
 
             peer_uuid = peer_loops.select_next_some() => {
                 debug!("peer {peer_uuid} finished");
-                if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected, PeerBuffered::default())).is_err() {
+                if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected, None)).is_err() {
                     // sending can only fail on socket drop, in which case connected_peers is unavailable, ignore
                     break Ok(());
                 }
+
                 data_channels.remove(&peer_uuid);
             }
 
@@ -311,12 +317,20 @@ async fn message_loop<M: Messenger>(
                             continue;
                         };
 
-                        if let Err(e) = data_channel.send(packet) {
-                            // Peer we're sending to closed their end of the connection.
-                            // We anticipate the PeerLeft event soon, but we sent a message before it came.
-                            // Do nothing. Only log it.
-                            warn!("failed to send to peer {peer} (socket closed): {e:?}");
-                        };
+                        if packet.len() > MAX_PACKET_SIZE {
+                            let _ = data_channel.send(Batch::new(peer, packet.len()).as_bytes());
+                            packet.chunks(MAX_PACKET_SIZE).for_each(|chunk| {
+                                let _ = data_channel.send(chunk.into());
+                            })
+                        }
+                        else {
+                            if let Err(e) = data_channel.send(packet) {
+                                // Peer we're sending to closed their end of the connection.
+                                // We anticipate the PeerLeft event soon, but we sent a message before it came.
+                                // Do nothing. Only log it.
+                                warn!("failed to send to peer {peer} (socket closed): {e:?}");
+                            };
+                        }
                     }
                     Some((_, None)) | None => {
                         // Receiver end of outgoing message channel closed,

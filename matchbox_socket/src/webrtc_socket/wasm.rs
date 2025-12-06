@@ -1,4 +1,4 @@
-use super::{HandshakeResult, PacketSendError, PeerDataSender, SignallerBuilder, error::JsErrorExt, messages::{PeerEvent, PeerRequest}, BufferedChannel};
+use super::{HandshakeResult, PacketSendError, PeerDataSender, SignallerBuilder, error::JsErrorExt, messages::{PeerEvent, PeerRequest}, BufferedChannel, StatsProvider};
 use crate::webrtc_socket::{
     ChannelConfig, Messenger, Packet, RtcIceServerConfig, Signaller, error::SignalingError,
     messages::PeerSignal, signal_peer::SignalPeer, socket::create_data_channels_ready_fut,
@@ -9,7 +9,7 @@ use futures::{Future, SinkExt, StreamExt};
 use futures_channel::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
 use futures_timer::Delay;
 use futures_util::{select, FutureExt};
-use js_sys::{Function, Reflect};
+use js_sys::{Function, Object, Reflect};
 use log::{debug, error, info, trace, warn};
 use matchbox_protocol::PeerId;
 use serde::Serialize;
@@ -18,12 +18,9 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use wasm_bindgen::{JsCast, JsValue, convert::FromWasmAbi, prelude::*};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{
-    Event, MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelInit, RtcDataChannelType,
-    RtcIceCandidateInit, RtcIceGatheringState, RtcPeerConnection, RtcPeerConnectionIceEvent,
-    RtcSdpType, RtcSessionDescriptionInit
-};
+use web_sys::{Event, MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelInit, RtcDataChannelType, RtcIceCandidateInit, RtcIceGatheringState, RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit, RtcStatsReport, RtcStatsReportInternal};
 use ws_stream_wasm::{WsMessage, WsMeta, WsStream};
+use crate::webrtc_socket::batch::Batch;
 use crate::webrtc_socket::error::PeerError;
 
 pub(crate) struct WasmSignaller {
@@ -52,6 +49,35 @@ impl Deref for RtcConnectionWrapper {
 impl RtcConnectionWrapper {
     fn new(conn: RtcPeerConnection) -> Arc<Self> {
         Arc::new(Self(conn))
+    }
+}
+
+#[async_trait(?Send)]
+impl StatsProvider for RtcConnectionWrapper {
+    async fn channel_bytes_sent_received(&self, stat_id: &str) -> Option<(usize, usize)> {
+        let stats_js = JsFuture::from(self.get_stats()).await.ok()?;
+        let stats: RtcStatsReport = stats_js.into();
+
+        let mut bytes_sent = 0usize;
+        let mut bytes_received = 0usize;
+        for val in stats.values() {
+            let Ok(report) = val else {
+                continue;
+            };
+
+            let report_type = Reflect::get(&report, &JsValue::from_str("type")).ok()?;
+            let label = Reflect::get(&report, &JsValue::from_str("label")).ok()?;
+
+            if report_type.as_string()? == "data-channel" && label.as_string()? == stat_id {
+                let sent = Reflect::get(&report, &JsValue::from_str("bytesSent")).ok()?;
+                let recv = Reflect::get(&report, &JsValue::from_str("bytesReceived")).ok()?;
+                bytes_sent = sent.as_f64()? as usize;
+                bytes_received = recv.as_f64()? as usize;
+                return Some((bytes_sent, bytes_received));
+            }
+        }
+
+        None
     }
 }
 
@@ -173,6 +199,10 @@ impl BufferedChannel for Arc<RtcDataChannelWrapper> {
     async fn buffered_amount(&self) -> usize {
         self.0.buffered_amount() as usize
     }
+
+    fn stats_id(&self) -> Option<String> {
+        Some(self.0.label())
+    }
 }
 
 pub(crate) struct WasmMessenger;
@@ -208,10 +238,11 @@ impl Messenger for WasmMessenger {
             channel_configs,
         );
 
+        let stats_provider = Arc::downgrade(&conn);
         let peer_buffered = PeerBuffered::new(data_channels.clone().iter().map(|it| {
             let channel: Box<dyn BufferedChannel> = Box::new(it.clone());
             return channel
-        }).collect::<Vec<_>>());
+        }).collect::<Vec<_>>(), stats_provider);
 
         // Create offer
         let offer = JsFuture::from(conn.create_offer()).await.efix().unwrap();
@@ -314,10 +345,11 @@ impl Messenger for WasmMessenger {
             channel_configs,
         );
 
+        let stats_provider = Arc::downgrade(&conn);
         let peer_buffered = PeerBuffered::new(data_channels.iter().map(|it| {
             let channel: Box<dyn BufferedChannel> = Box::new(it.clone());
             return channel
-        }).collect::<Vec<_>>());
+        }).collect::<Vec<_>>(), stats_provider);
 
         let mut received_candidates = vec![];
 
@@ -644,6 +676,7 @@ fn create_data_channel(
         },
     );
 
+    let mut current_batch = None;
     leaking_channel_event_handler(
         |f| channel.set_onmessage(f),
         move |event: MessageEvent| {
@@ -651,6 +684,22 @@ fn create_data_channel(
             if let Ok(arraybuf) = event.data().dyn_into::<js_sys::ArrayBuffer>() {
                 let uarray = js_sys::Uint8Array::new(&arraybuf);
                 let body = uarray.to_vec();
+                if let Some(batch) = Batch::from_bytes(&body, &peer_id) {
+                    current_batch.replace(batch);
+                    return;
+                }
+
+                if let Some(batch) = current_batch.as_mut() {
+                    if batch.full_fill(&body) {
+                        if let Err(e) = incoming_tx.unbounded_send((peer_id, body.into_boxed_slice())) {
+                            warn!("failed to notify about data channel message: {e:?}");
+                        }
+
+                        current_batch.take();
+                    }
+
+                    return;
+                }
 
                 if let Err(e) = incoming_tx.unbounded_send((peer_id, body.into_boxed_slice())) {
                     // should only happen if the socket is dropped, or we are out of memory

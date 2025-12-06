@@ -1,4 +1,5 @@
-use super::{HandshakeResult, PacketSendError, PeerDataSender, SignallerBuilder, messages::{PeerEvent, PeerRequest}, PeerBuffered, BufferedChannel};
+use super::{HandshakeResult, PacketSendError, PeerDataSender, SignallerBuilder, messages::{PeerEvent, PeerRequest}, PeerBuffered, BufferedChannel, StatsProvider};
+use webrtc::stats::StatsReportType;
 use crate::{
     RtcIceServerConfig,
     webrtc_socket::{
@@ -26,6 +27,7 @@ use log::{debug, error, info, trace, warn};
 use matchbox_protocol::PeerId;
 use std::{pin::Pin, sync::Arc, time::Duration};
 use std::ops::Deref;
+use std::sync::Weak;
 use futures::executor::block_on;
 use webrtc::{api::APIBuilder, data_channel::{RTCDataChannel, data_channel_init::RTCDataChannelInit}, ice_transport::{
     ice_candidate::{RTCIceCandidate, RTCIceCandidateInit},
@@ -35,6 +37,7 @@ use webrtc::{api::APIBuilder, data_channel::{RTCDataChannel, data_channel_init::
     sdp::session_description::RTCSessionDescription,
 }, Error};
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+use crate::webrtc_socket::batch::Batch;
 use crate::webrtc_socket::error::PeerError;
 
 impl From<webrtc::Error> for SignalingError {
@@ -63,6 +66,19 @@ impl Deref for RtcDataChannelWrapper {
     type Target = Arc<RTCDataChannel>;
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+#[async_trait]
+impl StatsProvider for RTCPeerConnection {
+    async fn channel_bytes_sent_received(&self, stats_id: &str) -> Option<(usize, usize)> {
+        self.get_stats().await.reports.values().find_map(|it| {
+            let StatsReportType::DataChannel(channel_report) = it else {
+                return None
+            };
+
+            channel_report.label.eq(stats_id).then(|| (channel_report.bytes_sent, channel_report.bytes_received))
+        })
     }
 }
 
@@ -164,6 +180,10 @@ impl BufferedChannel for Arc<RtcDataChannelWrapper> {
     async fn buffered_amount(&self) -> usize {
         RTCDataChannel::buffered_amount(&self).await
     }
+
+    fn stats_id(&self) -> Option<String> {
+        Some(self.label().to_owned())
+    }
 }
 
 #[async_trait]
@@ -209,10 +229,11 @@ impl Messenger for NativeMessenger {
             )
             .await?;
 
+            let stats = Arc::downgrade(&connection);
             let peer_buffered = PeerBuffered::new(data_channels.iter().map(|it| {
                 let channel: Box<dyn BufferedChannel> = Box::new(it.clone());
                 channel
-            }).collect::<Vec<_>>());
+            }).collect::<Vec<_>>(), stats);
 
             // TODO: maybe pass in options? ice restart etc.?
             let offer = connection.create_offer(None).await.unwrap();
@@ -309,10 +330,11 @@ impl Messenger for NativeMessenger {
             )
             .await?;
 
+            let stats_provider = Arc::downgrade(&connection);
             let peer_buffered = PeerBuffered::new(data_channels.iter().map(|it| {
                 let channel: Box<dyn BufferedChannel> = Box::new(it.clone());
                 channel
-            }).collect::<Vec<_>>());
+            }).collect::<Vec<_>>(), stats_provider);
 
             let offer = loop {
                 let signal = match peer_signal_rx.next().await {
@@ -637,9 +659,10 @@ async fn create_data_channel(
         ..Default::default()
     };
 
-    let channel = RtcDataChannelWrapper::new(connection
+    let ch = connection
         .create_data_channel(&format!("matchbox_socket_{channel_index}"), Some(config))
-        .await.map_err(|it| PeerError(peer_id.clone(), it.into()))?);
+        .await.map_err(|it| PeerError(peer_id.clone(), it.into()))?;
+    let channel = RtcDataChannelWrapper::new(ch);
 
     channel.on_open(Box::new(move || {
         debug!("Data channel ready");
@@ -672,8 +695,21 @@ async fn create_data_channel(
         }));
     }
 
+    let mut current_batch = None::<Batch>;
     channel.on_message(Box::new(move |message| {
-        let packet = (*message.data).into();
+        let packet: Packet = (*message.data).into();
+        if let Some(batch) = Batch::from_bytes(&packet, &peer_id) {
+            current_batch.replace(batch);
+        }
+
+        if let Some(batch) = current_batch.as_mut() {
+            if batch.full_fill(&packet) {
+                current_batch.take();
+            }
+
+            return Box::pin(async move {});
+        };
+
         if let Err(e) = from_peer_message_tx.unbounded_send((peer_id, packet)) {
             // should only happen if the socket is dropped, or we are out of memory
             warn!("failed to notify about data channel message: {e:?}");

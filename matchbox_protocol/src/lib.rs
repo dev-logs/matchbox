@@ -1,3 +1,4 @@
+use bincode::{Decode, Encode};
 use cfg_if::cfg_if;
 use derive_more::{Display, From};
 use serde::{Deserialize, Serialize};
@@ -5,7 +6,7 @@ use uuid::Uuid;
 
 /// The format for a peer signature given by the signaling server
 #[derive(
-    Debug, Display, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, From, Hash, PartialOrd, Ord,
+    Debug, Display, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, From, Hash, PartialOrd, Ord
 )]
 pub struct PeerId(pub Uuid);
 
