@@ -37,12 +37,12 @@ cfg_if! {
         pub type JsonPeerEvent = PeerEvent<serde_json::Value>;
         use std::fmt;
 
-
         impl fmt::Display for JsonPeerRequest {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write!(f, "{}", serde_json::to_string(self).map_err(|_| fmt::Error)?)
             }
         }
+
         impl std::str::FromStr for JsonPeerRequest {
             type Err = serde_json::Error;
 

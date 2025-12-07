@@ -125,7 +125,7 @@ impl PeerBuffered {
                 break;
             }
 
-            Delay::new(Duration::from_millis(10)).await;
+            Delay::new(Duration::from_millis(1)).await;
         }
     }
 }
