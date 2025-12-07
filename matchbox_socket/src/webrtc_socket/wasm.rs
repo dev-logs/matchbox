@@ -689,19 +689,19 @@ fn create_data_channel(
                     return;
                 }
 
-                if let Some(batch) = current_batch.as_mut() {
+                let packet = if let Some(batch) = current_batch.as_mut() {
                     if batch.full_fill(&body) {
-                        if let Err(e) = incoming_tx.unbounded_send((peer_id, body.into_boxed_slice())) {
-                            warn!("failed to notify about data channel message: {e:?}");
-                        }
-
-                        current_batch.take();
+                       current_batch.take().map(|it| it.into_packet()).unwrap_or_default()
                     }
-
-                    return;
+                    else {
+                        return;
+                    }
                 }
+                else {
+                    body.into_boxed_slice()
+                };
 
-                if let Err(e) = incoming_tx.unbounded_send((peer_id, body.into_boxed_slice())) {
+                if let Err(e) = incoming_tx.unbounded_send((peer_id, packet)) {
                     // should only happen if the socket is dropped, or we are out of memory
                     warn!("failed to notify about data channel message: {e:?}");
                 }

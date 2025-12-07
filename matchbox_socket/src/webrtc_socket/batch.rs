@@ -66,4 +66,8 @@ impl Batch {
         self.buffer.extend_from_slice(data);
         self.buffer.len() >= self.size
     }
+
+    pub fn into_packet(self) -> Packet {
+        self.buffer.into_boxed_slice()
+    }
 }

@@ -697,17 +697,19 @@ async fn create_data_channel(
 
     let mut current_batch = None::<Batch>;
     channel.on_message(Box::new(move |message| {
-        let packet: Packet = (*message.data).into();
+        let mut packet: Packet = (*message.data).into();
         if let Some(batch) = Batch::from_bytes(&packet, &peer_id) {
             current_batch.replace(batch);
+            return Box::pin(async move {});
         }
 
         if let Some(batch) = current_batch.as_mut() {
             if batch.full_fill(&packet) {
-                current_batch.take();
+                packet = current_batch.take().map(|it| it.into_packet()).unwrap_or_default();
             }
-
-            return Box::pin(async move {});
+            else {
+                return Box::pin(async move {});
+            }
         };
 
         if let Err(e) = from_peer_message_tx.unbounded_send((peer_id, packet)) {
