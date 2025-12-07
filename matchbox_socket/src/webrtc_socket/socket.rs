@@ -12,7 +12,7 @@ use futures::{
     future::Fuse, select,
 };
 use futures_channel::mpsc::{SendError, TrySendError, UnboundedReceiver, UnboundedSender};
-use log::{debug, error};
+use log::{debug, error, info};
 use matchbox_protocol::PeerId;
 use std::{collections::HashMap, future::ready, pin::Pin, sync::Arc, task::Poll, time::Duration};
 use tokio_util::{
@@ -575,9 +575,12 @@ impl WebRtcSocket {
         let mut changes = Vec::new();
         while let Ok(res) = self.peer_state_rx.try_next() {
             match res {
-                Some((id, state, Some(buffer))) => {
+                Some((id, state, buffer)) => {
                     let old = self.peers.insert(id, state);
-                    self.peer_buffer_info.insert(id, buffer);
+                    if let Some(buffer) = buffer {
+                        self.peer_buffer_info.insert(id, buffer);
+                    }
+                    
                     if old != Some(state) {
                         changes.push((id, state));
                     }
@@ -871,12 +874,12 @@ async fn run_socket(
 
     let mut message_loop_done = Box::pin(message_loop_fut.fuse());
     let mut signaling_loop_done = Box::pin(signaling_loop_fut.fuse());
-    loop {
+    let result = loop {
         select! {
             msgloop = message_loop_done => {
                 match msgloop {
                     Ok(()) | Err(SignalingError::StreamExhausted) => {
-                        debug!("Message loop completed");
+                        info!("Message loop completed due to exhausted");
                         break Ok(())
                     },
                     Err(e) => {
@@ -889,9 +892,9 @@ async fn run_socket(
 
             sigloop = signaling_loop_done => {
                 match sigloop {
-                    Ok(()) => debug!("Signaling loop completed"),
+                    Ok(()) => info!("Signaling loop completed"),
                     Err(SignalingError::StreamExhausted) => {
-                        debug!("Signaling loop completed");
+                        info!("Signaling loop completed due to exhausted");
                         break Ok(());
                     },
                     Err(e) => {
@@ -904,7 +907,10 @@ async fn run_socket(
 
             complete => break Ok(())
         }
-    }
+    };
+
+    log::info!("WebRtcSocket stopped with result {result:?}");
+    result
 }
 
 fn compat_read_write(

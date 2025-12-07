@@ -12,7 +12,7 @@ use futures::{Future, FutureExt, StreamExt, future::Either, stream::FuturesUnord
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures_timer::Delay;
 use futures_util::select;
-use log::{debug, error, warn};
+use log::{debug, error, warn, info};
 use matchbox_protocol::PeerId;
 pub use messages::*;
 pub(crate) use socket::MessageLoopChannels;
@@ -95,16 +95,22 @@ async fn signaling_loop(
     mut requests_receiver: futures_channel::mpsc::UnboundedReceiver<PeerRequest>,
     events_sender: futures_channel::mpsc::UnboundedSender<PeerEvent>,
 ) -> Result<(), SignalingError> {
+    log::info!("connecting to signaller");
     let mut signaller = builder.new_signaller(attempts, room_url).await?;
+    log::info!("connected to signaller");
 
     loop {
         select! {
             request = requests_receiver.next().fuse() => {
                 debug!("-> {request:?}");
-                let Some(request) = request else {break Err(SignalingError::StreamExhausted)};
-                signaller.send(request).await?;
+                let Some(request) = request else {
+                    info!("signaller stream exhausted, stop loop");
+                    break Err(SignalingError::StreamExhausted)
+                };
+                if let Err(e) = signaller.send(request).await {
+                    info!("failed to send request to signaller: {e:?}");
+                }
             }
-
             message = signaller.next_message().fuse() => {
                 match message {
                     Ok(message) => {
@@ -112,14 +118,18 @@ async fn signaling_loop(
                         events_sender.unbounded_send(message).map_err(SignalingError::from)?;
                     }
                     Err(SignalingError::UnknownFormat) => {
-                        warn!("ignoring unexpected non-text message from signaling server")
+                        info!("ignoring unexpected non-text message from signaling server")
                     },
-                    Err(err) => break Err(err)
+                    Err(err) => {
+                        info!("error during signaling loop: {err:?}");
+                        break Err(err)
+                    }
                 }
-
             }
-
-            complete => break Ok(())
+            complete => {
+                log::info!("signaller stream closed, stop loop");
+                break Ok(())
+            }
         }
     }
 }
@@ -208,6 +218,7 @@ async fn message_loop<M: Messenger>(
     }
         .fuse();
 
+    let peer_state_tx = peer_state_tx.clone();
     loop {
         let mut next_peer_messages_out = peer_messages_out_rx
             .iter_mut()
@@ -220,8 +231,8 @@ async fn message_loop<M: Messenger>(
         select! {
             _  = &mut timeout => {
                 if requests_sender.unbounded_send(PeerRequest::KeepAlive).is_err() {
-                    // socket dropped
-                    break Ok(());
+                    info!("1. Socket receiver was dropped, exit cleanly.");
+                    break Ok::<(), SignalingError>(());
                 }
                 if let Some(interval) = keep_alive_interval {
                     timeout = Either::Left(Delay::new(interval)).fuse();
@@ -236,7 +247,7 @@ async fn message_loop<M: Messenger>(
                     match event {
                         PeerEvent::IdAssigned(peer_uuid) => {
                             if id_tx.take().expect("already sent peer id").send(peer_uuid.to_owned()).is_err() {
-                                // Socket receiver was dropped, exit cleanly.
+                                info!("2. Socket receiver was dropped, exit cleanly.");
                                 break Ok(());
                             };
                         },
@@ -249,7 +260,7 @@ async fn message_loop<M: Messenger>(
                         PeerEvent::PeerLeft(peer_uuid) => {
                             if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected, None)).is_err() {
                                 // socket dropped, exit cleanly
-                                warn!("Stop message loop because failed to send peer left event to peer {peer_uuid} (socket dropped)");
+                                info!("3. Stop message loop because failed to send peer left event to peer {peer_uuid} (socket dropped)");
                                 break Ok(());
                             }
 
@@ -265,7 +276,7 @@ async fn message_loop<M: Messenger>(
                             });
 
                             if let Err(e) = signal_tx.unbounded_send(data) {
-                                warn!("ignoring signal from peer {sender} because the handshake has already finished {e:?}");
+                                info!("ignoring signal from peer {sender} because the handshake has already finished {e:?}");
                             }
                         },
                     }
@@ -276,11 +287,11 @@ async fn message_loop<M: Messenger>(
                  let handshake_result = match handshake_result {
                     Ok(handshake_result) => handshake_result,
                     Err(PeerError(peer_id, error)) => {
-                        warn!("error during handshake for peer {peer_id}: {error:?}");
+                        info!("error during handshake for peer {peer_id}: {error:?}");
 
                         data_channels.remove(&peer_id);
                         if peer_state_tx.unbounded_send((peer_id, PeerState::Disconnected, None)).is_err() {
-                            // socket dropped, exit cleanly
+                            info!("4. socket dropped, exit cleanly");
                             break Ok(());
                         }
 
@@ -290,7 +301,7 @@ async fn message_loop<M: Messenger>(
 
                 data_channels.insert(handshake_result.peer_id, handshake_result.data_channels);
                 if peer_state_tx.unbounded_send((handshake_result.peer_id, PeerState::Connected, Some(handshake_result.peer_buffered.clone()))).is_err() {
-                    // sending can only fail on socket drop, in which case connected_peers is unavailable, ignore
+                    info!("4.1 sending can only fail on socket drop, in which case connected_peers is unavailable, ignore");
                     break Ok(());
                 }
 
@@ -298,13 +309,16 @@ async fn message_loop<M: Messenger>(
             }
 
             peer_uuid = peer_loops.select_next_some() => {
-                debug!("peer {peer_uuid} finished");
+                info!("peer {peer_uuid} finished");
                 if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected, None)).is_err() {
                     // sending can only fail on socket drop, in which case connected_peers is unavailable, ignore
+                    info!("5. Cannot send peer left event to peer {peer_uuid} (socket dropped), ignoring");
                     break Ok(());
                 }
 
                 data_channels.remove(&peer_uuid);
+                log::info!("peer {peer_uuid} disconnected, removing from connected peers");
+                continue;
             }
 
             message = next_peer_message_out => {
@@ -313,7 +327,7 @@ async fn message_loop<M: Messenger>(
                         let Some(data_channel) = data_channels
                             .get_mut(&peer)
                             .and_then(|it| it.get_mut(channel_index)) else {
-                            log::warn!("received message for unknown peer {peer}");
+                            log::info!("received message for unknown peer {peer}");
                             continue;
                         };
 
@@ -328,7 +342,7 @@ async fn message_loop<M: Messenger>(
                                 // Peer we're sending to closed their end of the connection.
                                 // We anticipate the PeerLeft event soon, but we sent a message before it came.
                                 // Do nothing. Only log it.
-                                warn!("failed to send to peer {peer} (socket closed): {e:?}");
+                                info!("failed to send to peer {peer} (socket closed): {e:?}");
                             };
                         }
                     }
@@ -337,13 +351,19 @@ async fn message_loop<M: Messenger>(
                         // which most likely means the socket was dropped.
                         // There could probably be cleaner ways to handle this,
                         // but for now, just exit cleanly.
-                        warn!("Outgoing message queue closed, message not sent");
+                        info!("6. Outgoing message queue closed, message not sent");
                         break Ok(());
                     }
                 }
             }
 
-            complete => break Ok(())
-        }
-    }
+            complete => {
+                info!("message loop complete");
+                break Ok(())
+            }
+        };
+    }?;
+
+    log::info!("message loop iteration complete");
+    Ok(())
 }
