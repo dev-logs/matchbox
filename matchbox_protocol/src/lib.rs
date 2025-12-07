@@ -1,3 +1,4 @@
+use bincode::{Decode, Encode};
 use cfg_if::cfg_if;
 use derive_more::{Display, From};
 use serde::{Deserialize, Serialize};
@@ -5,7 +6,7 @@ use uuid::Uuid;
 
 /// The format for a peer signature given by the signaling server
 #[derive(
-    Debug, Display, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, From, Hash, PartialOrd, Ord,
+    Debug, Display, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, From, Hash, PartialOrd, Ord
 )]
 pub struct PeerId(pub Uuid);
 
@@ -36,12 +37,12 @@ cfg_if! {
         pub type JsonPeerEvent = PeerEvent<serde_json::Value>;
         use std::fmt;
 
-
         impl fmt::Display for JsonPeerRequest {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write!(f, "{}", serde_json::to_string(self).map_err(|_| fmt::Error)?)
             }
         }
+
         impl std::str::FromStr for JsonPeerRequest {
             type Err = serde_json::Error;
 

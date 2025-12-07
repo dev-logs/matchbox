@@ -1,5 +1,5 @@
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use async_trait::async_trait;
 use futures_timer::Delay;
@@ -39,12 +39,14 @@ impl<T> MaybeSend for T where T: Send {}
 pub trait BufferedChannel: MaybeSend + Sync {
     /// Returns the current buffered amount in the channel.
     async fn buffered_amount(&self) -> usize;
+    fn stats_id(&self) -> Option<String>;
 }
 
 /// Manages multiple buffered channels, providing utilities to query and flush them.
-#[derive(Clone, Default)]
-pub struct PeerBuffered {
-    channel_refs: Arc<Vec<Box<dyn BufferedChannel>>>
+#[derive(Clone)]
+pub struct PeerBuffered{
+    channel_refs: Arc<Vec<Box<dyn BufferedChannel>>>,
+    stats_provider: Weak<dyn StatsProvider>,
 }
 
 impl Debug for PeerBuffered {
@@ -55,13 +57,31 @@ impl Debug for PeerBuffered {
     }
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait StatsProvider: MaybeSend + Sync {
+    async fn channel_bytes_sent_received(&self, stat_id: &str) -> Option<(usize, usize)>;
+}
+
 impl PeerBuffered {
     /// Creates a new PeerBuffered with the specified number of channels.
-    pub(crate) fn new(channels: Vec<Box<dyn BufferedChannel>>) -> Self {
-
+    pub(crate) fn new(channels: Vec<Box<dyn BufferedChannel>>, stats_provider: Weak<dyn StatsProvider>) -> Self {
         Self {
-            channel_refs: Arc::new(channels)
+            channel_refs: Arc::new(channels),
+            stats_provider,
         }
+    }
+
+    pub async fn channel_bytes_sent_received(&self, index: usize) -> Option<(usize, usize)> {
+        let Some(stat_id) = self.channel_refs.get(index)?.stats_id() else {
+            return None;
+        };
+
+        if let Some(provider) = self.stats_provider.upgrade() {
+            return provider.channel_bytes_sent_received(&stat_id).await
+        };
+
+        None
     }
 
     /// Return the number of channels.
@@ -105,7 +125,7 @@ impl PeerBuffered {
                 break;
             }
 
-            Delay::new(Duration::from_millis(10)).await;
+            Delay::new(Duration::from_millis(1)).await;
         }
     }
 }
