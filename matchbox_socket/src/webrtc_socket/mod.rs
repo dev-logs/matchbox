@@ -153,6 +153,8 @@ trait PeerDataSender {
     fn send(&mut self, packet: Packet) -> Result<(), PacketSendError>;
 
     async fn close(&mut self) -> Result<(), PacketSendError>;
+
+    fn is_reliable(&self) -> bool;
 }
 
 struct HandshakeResult<D: PeerDataSender, M> {
@@ -331,7 +333,7 @@ async fn message_loop<M: Messenger>(
                             continue;
                         };
 
-                        if packet.len() > MAX_PACKET_SIZE {
+                        if packet.len() > MAX_PACKET_SIZE && data_channel.is_reliable() {
                             let _ = data_channel.send(Batch::new(peer, packet.len()).as_bytes());
                             packet.chunks(MAX_PACKET_SIZE).for_each(|chunk| {
                                 let _ = data_channel.send(chunk.into());

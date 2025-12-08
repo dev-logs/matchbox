@@ -186,6 +186,10 @@ impl PeerDataSender for Arc<RtcDataChannelWrapper> {
             .map_err(|source| PacketSendError { source })
     }
 
+    fn is_reliable(&self) -> bool {
+        self.0.reliable()
+    }
+
     async fn close(&mut self) -> Result<(), PacketSendError> {
         info!("closing data channel");
         self.0.close();
@@ -676,6 +680,7 @@ fn create_data_channel(
         },
     );
 
+    let is_reliable = channel.reliable();
     let mut current_batch = None;
     leaking_channel_event_handler(
         |f| channel.set_onmessage(f),
@@ -684,7 +689,9 @@ fn create_data_channel(
             if let Ok(arraybuf) = event.data().dyn_into::<js_sys::ArrayBuffer>() {
                 let uarray = js_sys::Uint8Array::new(&arraybuf);
                 let body = uarray.to_vec();
-                if let Some(batch) = Batch::from_bytes(&body, &peer_id) {
+                if let Some(batch) = if !is_reliable { None } else {
+                    Batch::from_bytes(&body, &peer_id)
+                } {
                     current_batch.replace(batch);
                     return;
                 }

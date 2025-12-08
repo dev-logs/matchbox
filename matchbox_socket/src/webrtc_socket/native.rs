@@ -26,7 +26,7 @@ use futures_util::{lock::Mutex, select};
 use log::{debug, error, info, trace, warn};
 use matchbox_protocol::PeerId;
 use std::{pin::Pin, sync::Arc, time::Duration};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::sync::Weak;
 use futures::executor::block_on;
 use webrtc::{api::APIBuilder, data_channel::{RTCDataChannel, data_channel_init::RTCDataChannelInit}, ice_transport::{
@@ -160,13 +160,35 @@ impl Signaller for NativeSignaller {
 
 pub(crate) struct NativeMessenger;
 
+pub(crate) struct PeerDataSenderWrapper<T> {
+    sender: UnboundedSender<T>,
+    is_reliable: bool,
+}
+
+impl<T> Deref for PeerDataSenderWrapper<T> where T: Send + 'static {
+    type Target = UnboundedSender<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.sender
+    }
+}
+
+impl<T> DerefMut for PeerDataSenderWrapper<T> where T: Send + 'static {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.sender
+    }
+}
+
 #[async_trait]
-impl PeerDataSender for UnboundedSender<Packet> {
+impl PeerDataSender for PeerDataSenderWrapper<Packet> {
     fn send(&mut self, packet: Packet) -> Result<(), PacketSendError> {
         self.unbounded_send(packet)
             .map_err(|source| PacketSendError {
                 source: TrySendError::into_send_error(source),
             })
+    }
+
+    fn is_reliable(&self) -> bool {
+        self.is_reliable
     }
 
     async fn close(&mut self) -> Result<(), PacketSendError> {
@@ -188,7 +210,7 @@ impl BufferedChannel for Arc<RtcDataChannelWrapper> {
 
 #[async_trait]
 impl Messenger for NativeMessenger {
-    type DataChannel = UnboundedSender<Packet>;
+    type DataChannel = PeerDataSenderWrapper<Packet>;
     type HandshakeMeta = (
         Vec<UnboundedReceiver<Packet>>,
         Vec<Arc<RtcDataChannelWrapper>>,
@@ -451,10 +473,19 @@ impl Messenger for NativeMessenger {
 
 fn new_senders_and_receivers<T>(
     channel_configs: &[ChannelConfig],
-) -> (Vec<UnboundedSender<T>>, Vec<UnboundedReceiver<T>>) {
-    (0..channel_configs.len())
-        .map(|_| futures_channel::mpsc::unbounded())
-        .unzip()
+) -> (Vec<PeerDataSenderWrapper<T>>, Vec<UnboundedReceiver<T>>) {
+    let mut tx = vec![];
+    let mut rx = vec![];
+    for channel_config in channel_configs {
+        let (s, r) = futures_channel::mpsc::unbounded();
+        tx.push(PeerDataSenderWrapper {
+            sender: s,
+            is_reliable: channel_config.ordered && channel_config.max_retransmits.is_none()
+        });
+        rx.push(r);
+    }
+
+    (tx, rx)
 }
 
 async fn complete_handshake<T: Future<Output = ()>>(
@@ -696,9 +727,13 @@ async fn create_data_channel(
     }
 
     let mut current_batch = None::<Batch>;
+    let is_reliable = channel_config.ordered &&
+        channel_config.max_retransmits.is_none();
     channel.on_message(Box::new(move |message| {
         let mut packet: Packet = (*message.data).into();
-        if let Some(batch) = Batch::from_bytes(&packet, &peer_id) {
+        if let Some(batch) = if !is_reliable { None } else {
+            Batch::from_bytes(&packet, &peer_id)
+        } {
             current_batch.replace(batch);
             return Box::pin(async move {});
         }
