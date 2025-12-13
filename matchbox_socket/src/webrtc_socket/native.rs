@@ -80,6 +80,18 @@ impl StatsProvider for RTCPeerConnection {
             channel_report.label.eq(stats_id).then(|| (channel_report.bytes_sent, channel_report.bytes_received))
         })
     }
+
+    async fn rtt(&self) -> Option<f64> {
+        self.get_stats().await.reports.values().find_map(|it| {
+            let StatsReportType::CandidatePair(pair_report) = it else {
+                return None;
+            };
+
+            // Return RTT in milliseconds, converting from seconds
+            // current_round_trip_time is in seconds, convert to milliseconds
+            Some(pair_report.current_round_trip_time * 1000.0)
+        })
+    }
 }
 
 impl Drop for RtcDataChannelWrapper {
@@ -241,7 +253,7 @@ impl Messenger for NativeMessenger {
             let (data_channel_ready_txs, data_channels_ready_fut) =
                 create_data_channels_ready_fut(channel_configs);
 
-            let data_channels = create_data_channels(
+            let (data_channels, buffer_low_rxs) = create_data_channels(
                 &connection,
                 data_channel_ready_txs,
                 signal_peer.id,
@@ -252,10 +264,14 @@ impl Messenger for NativeMessenger {
             .await?;
 
             let stats = Arc::downgrade(&connection);
-            let peer_buffered = PeerBuffered::new(data_channels.iter().map(|it| {
-                let channel: Box<dyn BufferedChannel> = Box::new(it.clone());
-                channel
-            }).collect::<Vec<_>>(), stats);
+            let peer_buffered = PeerBuffered::new(
+                data_channels.iter().map(|it| {
+                    let channel: Box<dyn BufferedChannel> = Box::new(it.clone());
+                    channel
+                }).collect::<Vec<_>>(),
+                stats,
+                buffer_low_rxs,
+            );
 
             // TODO: maybe pass in options? ice restart etc.?
             let offer = connection.create_offer(None).await.unwrap();
@@ -342,7 +358,7 @@ impl Messenger for NativeMessenger {
             let (data_channel_ready_txs, data_channels_ready_fut) =
                 create_data_channels_ready_fut(channel_configs);
 
-            let data_channels = create_data_channels(
+            let (data_channels, buffer_low_rxs) = create_data_channels(
                 &connection,
                 data_channel_ready_txs,
                 signal_peer.id,
@@ -353,10 +369,14 @@ impl Messenger for NativeMessenger {
             .await?;
 
             let stats_provider = Arc::downgrade(&connection);
-            let peer_buffered = PeerBuffered::new(data_channels.iter().map(|it| {
-                let channel: Box<dyn BufferedChannel> = Box::new(it.clone());
-                channel
-            }).collect::<Vec<_>>(), stats_provider);
+            let peer_buffered = PeerBuffered::new(
+                data_channels.iter().map(|it| {
+                    let channel: Box<dyn BufferedChannel> = Box::new(it.clone());
+                    channel
+                }).collect::<Vec<_>>(),
+                stats_provider,
+                buffer_low_rxs,
+            );
 
             let offer = loop {
                 let signal = match peer_signal_rx.next().await {
@@ -654,15 +674,19 @@ async fn create_data_channels(
     peer_disconnected_tx: Sender<()>,
     from_peer_message_tx: Vec<UnboundedSender<(PeerId, Packet)>>,
     channel_configs: &[ChannelConfig],
-) -> Result<Vec<Arc<RtcDataChannelWrapper>>, PeerError> {
+) -> Result<(Vec<Arc<RtcDataChannelWrapper>>, Vec<futures_channel::mpsc::UnboundedReceiver<()>>), PeerError> {
     let mut channels = vec![];
+    let mut buffer_low_rxs = Vec::new();
     for (i, channel_config) in channel_configs.iter().enumerate() {
+        let (buffer_low_tx, buffer_low_rx) = futures_channel::mpsc::unbounded();
+        buffer_low_rxs.push(buffer_low_rx);
         let channel = create_data_channel(
             connection,
             data_channel_ready_txs.pop().unwrap(),
             peer_id,
             peer_disconnected_tx.clone(),
             from_peer_message_tx.get(i).unwrap().clone(),
+            buffer_low_tx,
             channel_config,
             i,
         )
@@ -671,7 +695,7 @@ async fn create_data_channels(
         channels.push(channel);
     }
 
-    Ok(channels)
+    Ok((channels, buffer_low_rxs))
 }
 
 async fn create_data_channel(
@@ -680,6 +704,7 @@ async fn create_data_channel(
     peer_id: PeerId,
     peer_disconnected_tx: Sender<()>,
     from_peer_message_tx: UnboundedSender<(PeerId, Packet)>,
+    buffer_low_tx: futures_channel::mpsc::UnboundedSender<()>,
     channel_config: &ChannelConfig,
     channel_index: usize,
 ) -> Result<Arc<RtcDataChannelWrapper>, PeerError> {
@@ -694,6 +719,11 @@ async fn create_data_channel(
         .create_data_channel(&format!("matchbox_socket_{channel_index}"), Some(config))
         .await.map_err(|it| PeerError(peer_id.clone(), it.into()))?;
     let channel = RtcDataChannelWrapper::new(ch);
+
+    // Set buffer low threshold if configured
+    if let Some(threshold) = channel_config.buffer_low_threshold {
+        channel.set_buffered_amount_low_threshold(threshold).await;
+    }
 
     channel.on_open(Box::new(move || {
         debug!("Data channel ready");
@@ -754,6 +784,12 @@ async fn create_data_channel(
 
         Box::pin(async move {})
     }));
+
+    channel.on_buffered_amount_low(Box::new(move || {
+        trace!("Data channel buffer low");
+        let _ = buffer_low_tx.unbounded_send(());
+        Box::pin(async move {})
+    })).await;
 
     Ok(channel)
 }

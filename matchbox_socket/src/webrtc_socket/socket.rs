@@ -46,24 +46,29 @@ pub struct ChannelConfig {
     /// Maximum number of retransmit attempts of a message before giving up
     /// See also: <https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel/maxRetransmits>
     pub max_retransmits: Option<u16>,
+    /// Threshold in bytes for triggering buffer low events
+    /// See also: <https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel/bufferedAmountLowThreshold>
+    pub buffer_low_threshold: Option<usize>,
 }
 
 impl ChannelConfig {
     /// Messages sent via an unreliable channel may arrive in any order or not at all, but arrive as
     /// quickly as possible.
-    pub fn unreliable() -> Self {
+    pub fn unreliable(low_amount: Option<usize>) -> Self {
         ChannelConfig {
             ordered: false,
             max_retransmits: Some(0),
+            buffer_low_threshold: low_amount,
         }
     }
 
     /// Messages sent via a reliable channel are guaranteed to arrive (and guaranteed to arrive in
     /// order the order they were sent) and will be retransmitted until they arrive.
-    pub fn reliable() -> Self {
+    pub fn reliable(low_amount: Option<usize>) -> Self {
         ChannelConfig {
             ordered: true,
             max_retransmits: None,
+            buffer_low_threshold: low_amount,
         }
     }
 }
@@ -173,14 +178,14 @@ impl WebRtcSocketBuilder {
     }
 
     /// Adds a new unreliable channel to the [`WebRtcSocket`] configuration.
-    pub fn add_unreliable_channel(mut self) -> WebRtcSocketBuilder {
-        self.config.channels.push(ChannelConfig::unreliable());
+    pub fn add_unreliable_channel(mut self, low_amount: Option<usize>) -> WebRtcSocketBuilder {
+        self.config.channels.push(ChannelConfig::unreliable(low_amount));
         self
     }
 
     /// Adds a new reliable channel to the [`WebRtcSocket`] configuration.
-    pub fn add_reliable_channel(mut self) -> WebRtcSocketBuilder {
-        self.config.channels.push(ChannelConfig::reliable());
+    pub fn add_reliable_channel(mut self, low_amount: Option<usize>) -> WebRtcSocketBuilder {
+        self.config.channels.push(ChannelConfig::reliable(low_amount));
         self
     }
 
@@ -505,7 +510,7 @@ impl WebRtcSocket {
     /// Please use the [`WebRtcSocketBuilder`] to create non-trivial sockets.
     pub fn new_unreliable(room_url: impl Into<String>) -> (WebRtcSocket, MessageLoopFuture) {
         WebRtcSocketBuilder::new(room_url)
-            .add_channel(ChannelConfig::unreliable())
+            .add_channel(ChannelConfig::unreliable(None))
             .build()
     }
 
@@ -518,7 +523,7 @@ impl WebRtcSocket {
     /// Please use the [`WebRtcSocketBuilder`] to create non-trivial sockets.
     pub fn new_reliable(room_url: impl Into<String>) -> (WebRtcSocket, MessageLoopFuture) {
         WebRtcSocketBuilder::new(room_url)
-            .add_channel(ChannelConfig::reliable())
+            .add_channel(ChannelConfig::reliable(None))
             .build()
     }
 }
@@ -941,7 +946,7 @@ mod test {
     async fn unreachable_server() {
         // .invalid is a reserved tld for testing and documentation
         let (_socket, fut) = WebRtcSocketBuilder::new("wss://example.invalid")
-            .add_channel(ChannelConfig::unreliable())
+            .add_channel(ChannelConfig::unreliable(None))
             .build();
 
         let result = fut.await;
@@ -956,7 +961,7 @@ mod test {
     async fn test_signaling_attempts() {
         let (_socket, loop_fut) = WebRtcSocketBuilder::new("wss://example.invalid/")
             .reconnect_attempts(Some(3))
-            .add_channel(ChannelConfig::reliable())
+            .add_channel(ChannelConfig::reliable(None))
             .build();
 
         let result = loop_fut.await;

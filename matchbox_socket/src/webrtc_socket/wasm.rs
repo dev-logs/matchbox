@@ -58,23 +58,105 @@ impl StatsProvider for RtcConnectionWrapper {
         let stats_js = JsFuture::from(self.get_stats()).await.ok()?;
         let stats: RtcStatsReport = stats_js.into();
 
-        let mut bytes_sent = 0usize;
-        let mut bytes_received = 0usize;
         for val in stats.values() {
             let Ok(report) = val else {
                 continue;
             };
 
-            let report_type = Reflect::get(&report, &JsValue::from_str("type")).ok()?;
-            let label = Reflect::get(&report, &JsValue::from_str("label")).ok()?;
+            // Get type field - continue to next entry if missing
+            let Ok(report_type) = Reflect::get(&report, &JsValue::from_str("type")) else {
+                continue;
+            };
 
-            if report_type.as_string()? == "data-channel" && label.as_string()? == stat_id {
-                let sent = Reflect::get(&report, &JsValue::from_str("bytesSent")).ok()?;
-                let recv = Reflect::get(&report, &JsValue::from_str("bytesReceived")).ok()?;
-                bytes_sent = sent.as_f64()? as usize;
-                bytes_received = recv.as_f64()? as usize;
-                return Some((bytes_sent, bytes_received));
+            // Check if this is a data-channel stat
+            let Some(type_str) = report_type.as_string() else {
+                continue;
+            };
+
+            if type_str != "data-channel" {
+                continue;
             }
+
+            // Get label field - continue to next entry if missing
+            let Ok(label) = Reflect::get(&report, &JsValue::from_str("label")) else {
+                continue;
+            };
+
+            let Some(label_str) = label.as_string() else {
+                continue;
+            };
+
+            if label_str != stat_id {
+                continue;
+            }
+
+            // Found the matching data channel, get the stats
+            let Ok(sent) = Reflect::get(&report, &JsValue::from_str("bytesSent")) else {
+                continue;
+            };
+            let Ok(recv) = Reflect::get(&report, &JsValue::from_str("bytesReceived")) else {
+                continue;
+            };
+
+            let Some(bytes_sent) = sent.as_f64() else {
+                continue;
+            };
+            let Some(bytes_received) = recv.as_f64() else {
+                continue;
+            };
+
+            return Some((bytes_sent as usize, bytes_received as usize));
+        }
+
+        None
+    }
+
+    async fn rtt(&self) -> Option<f64> {
+        let stats_js = JsFuture::from(self.get_stats()).await.ok()?;
+        let stats: RtcStatsReport = stats_js.into();
+
+        for val in stats.values() {
+            let Ok(report) = val else {
+                continue;
+            };
+
+            // Get type field - continue to next entry if missing
+            let Ok(report_type) = Reflect::get(&report, &JsValue::from_str("type")) else {
+                continue;
+            };
+
+            // Check if this is a candidate-pair stat
+            let Some(type_str) = report_type.as_string() else {
+                continue;
+            };
+
+            if type_str != "candidate-pair" {
+                continue;
+            }
+
+            // Check if this is the active/selected candidate pair
+            let Ok(state) = Reflect::get(&report, &JsValue::from_str("state")) else {
+                continue;
+            };
+
+            let Some(state_str) = state.as_string() else {
+                continue;
+            };
+
+            if state_str != "succeeded" {
+                continue;
+            }
+
+            // Get currentRoundTripTime which is in seconds, convert to milliseconds
+            let Ok(rtt) = Reflect::get(&report, &JsValue::from_str("currentRoundTripTime")) else {
+                continue;
+            };
+
+            let Some(rtt_seconds) = rtt.as_f64() else {
+                continue;
+            };
+
+            return Some(rtt_seconds * 1000.0);
         }
 
         None
@@ -233,7 +315,7 @@ impl Messenger for WasmMessenger {
 
         let (peer_disconnected_tx, peer_disconnected_rx) = futures_channel::mpsc::channel(1);
 
-        let data_channels = create_data_channels(
+        let (data_channels, buffer_low_rxs) = create_data_channels(
             conn.clone(),
             messages_from_peers_tx,
             signal_peer.id,
@@ -243,10 +325,14 @@ impl Messenger for WasmMessenger {
         );
 
         let stats_provider = Arc::downgrade(&conn);
-        let peer_buffered = PeerBuffered::new(data_channels.clone().iter().map(|it| {
-            let channel: Box<dyn BufferedChannel> = Box::new(it.clone());
-            return channel
-        }).collect::<Vec<_>>(), stats_provider);
+        let peer_buffered = PeerBuffered::new(
+            data_channels.clone().iter().map(|it| {
+                let channel: Box<dyn BufferedChannel> = Box::new(it.clone());
+                return channel
+            }).collect::<Vec<_>>(),
+            stats_provider,
+            buffer_low_rxs,
+        );
 
         // Create offer
         let offer = JsFuture::from(conn.create_offer()).await.efix().unwrap();
@@ -340,7 +426,7 @@ impl Messenger for WasmMessenger {
 
         let (peer_disconnected_tx, peer_disconnected_rx) = futures_channel::mpsc::channel(1);
 
-        let data_channels = create_data_channels(
+        let (data_channels, buffer_low_rxs) = create_data_channels(
             conn.clone(),
             messages_from_peers_tx,
             signal_peer.id,
@@ -350,10 +436,14 @@ impl Messenger for WasmMessenger {
         );
 
         let stats_provider = Arc::downgrade(&conn);
-        let peer_buffered = PeerBuffered::new(data_channels.iter().map(|it| {
-            let channel: Box<dyn BufferedChannel> = Box::new(it.clone());
-            return channel
-        }).collect::<Vec<_>>(), stats_provider);
+        let peer_buffered = PeerBuffered::new(
+            data_channels.iter().map(|it| {
+                let channel: Box<dyn BufferedChannel> = Box::new(it.clone());
+                return channel
+            }).collect::<Vec<_>>(),
+            stats_provider,
+            buffer_low_rxs,
+        );
 
         let mut received_candidates = vec![];
 
@@ -633,22 +723,27 @@ fn create_data_channels(
     peer_disconnected_tx: futures_channel::mpsc::Sender<()>,
     mut data_channel_ready_txs: Vec<futures_channel::mpsc::Sender<()>>,
     channel_config: &[ChannelConfig],
-) -> Vec<Arc<RtcDataChannelWrapper>> {
-    channel_config
+) -> (Vec<Arc<RtcDataChannelWrapper>>, Vec<futures_channel::mpsc::UnboundedReceiver<()>>) {
+    let mut buffer_low_rxs = Vec::new();
+    let channels = channel_config
         .iter()
         .enumerate()
         .map(|(i, channel)| {
+            let (buffer_low_tx, buffer_low_rx) = futures_channel::mpsc::unbounded();
+            buffer_low_rxs.push(buffer_low_rx);
             create_data_channel(
                 connection.clone(),
                 incoming_tx.get_mut(i).unwrap().clone(),
                 peer_id,
                 peer_disconnected_tx.clone(),
                 data_channel_ready_txs.pop().unwrap(),
+                buffer_low_tx,
                 channel,
                 i,
             )
         })
-        .collect()
+        .collect();
+    (channels, buffer_low_rxs)
 }
 
 fn create_data_channel(
@@ -657,6 +752,7 @@ fn create_data_channel(
     peer_id: PeerId,
     peer_disconnected_tx: futures_channel::mpsc::Sender<()>,
     mut channel_open: futures_channel::mpsc::Sender<()>,
+    buffer_low_tx: futures_channel::mpsc::UnboundedSender<()>,
     channel_config: &ChannelConfig,
     channel_id: usize,
 ) -> Arc<RtcDataChannelWrapper> {
@@ -669,6 +765,11 @@ fn create_data_channel(
     ));
 
     channel.set_binary_type(RtcDataChannelType::Arraybuffer);
+
+    // Set buffer low threshold if configured
+    if let Some(threshold) = channel_config.buffer_low_threshold {
+        channel.set_buffered_amount_low_threshold(threshold as u32);
+    }
 
     leaking_channel_event_handler(
         |f| channel.set_onopen(f),
@@ -742,6 +843,14 @@ fn create_data_channel(
                 // should only happen if the socket is dropped, or we are out of memory
                 warn!("failed to notify about data channel closing: {err:?}");
             }
+        },
+    );
+
+    leaking_channel_event_handler(
+        |f| channel.set_onbufferedamountlow(f),
+        move |_event: Event| {
+            trace!("data channel buffer low: {channel_id}");
+            let _ = buffer_low_tx.unbounded_send(());
         },
     );
 

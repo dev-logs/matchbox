@@ -1,8 +1,9 @@
 use std::fmt::Debug;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use n0_future::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures_timer::Delay;
+use futures_util::lock::Mutex;
 use serde::{Deserialize, Serialize};
 
 /// Events go from signaling server to peer
@@ -44,9 +45,11 @@ pub trait BufferedChannel: MaybeSend + Sync {
 
 /// Manages multiple buffered channels, providing utilities to query and flush them.
 #[derive(Clone)]
-pub struct PeerBuffered{
+pub struct PeerBuffered {
     channel_refs: Arc<Vec<Box<dyn BufferedChannel>>>,
     stats_provider: Weak<dyn StatsProvider>,
+    rtt_cache: Arc<Mutex<Option<(f64, Instant)>>>,
+    buffer_low_rx: Vec<Arc<Mutex<futures_channel::mpsc::UnboundedReceiver<()>>>>,
 }
 
 impl Debug for PeerBuffered {
@@ -61,17 +64,29 @@ impl Debug for PeerBuffered {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait StatsProvider: MaybeSend + Sync {
     async fn channel_bytes_sent_received(&self, stat_id: &str) -> Option<(usize, usize)>;
+    async fn rtt(&self) -> Option<f64>;
 }
 
 impl PeerBuffered {
     /// Creates a new PeerBuffered with the specified number of channels.
-    pub(crate) fn new(channels: Vec<Box<dyn BufferedChannel>>, stats_provider: Weak<dyn StatsProvider>) -> Self {
+    pub(crate) fn new(
+        channels: Vec<Box<dyn BufferedChannel>>,
+        stats_provider: Weak<dyn StatsProvider>,
+        buffer_low_rx: Vec<futures_channel::mpsc::UnboundedReceiver<()>>,
+    ) -> Self {
         Self {
             channel_refs: Arc::new(channels),
             stats_provider,
+            rtt_cache: Arc::new(Mutex::new(None)),
+            buffer_low_rx: buffer_low_rx
+                .into_iter()
+                .map(|rx| Arc::new(Mutex::new(rx)))
+                .collect(),
         }
     }
 
+    /// Returns the number of bytes sent and received for the channel at the given index.
+    /// Returns None if the channel doesn't exist or stats are unavailable.
     pub async fn channel_bytes_sent_received(&self, index: usize) -> Option<(usize, usize)> {
         let Some(stat_id) = self.channel_refs.get(index)?.stats_id() else {
             return None;
@@ -126,6 +141,86 @@ impl PeerBuffered {
             }
 
             Delay::new(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Returns the current Round Trip Time (RTT) in milliseconds.
+    /// Returns None if the stats provider is unavailable or RTT cannot be determined.
+    ///
+    /// The RTT value is cached and only refreshed if the cached value is older than 1 second.
+    /// This prevents excessive stats queries when rtt() is called frequently.
+    pub async fn rtt(&self) -> Option<f64> {
+        let now = Instant::now();
+
+        // Check if we have a valid cached value
+        {
+            let cache = self.rtt_cache.lock().await;
+            if let Some((cached_rtt, cached_time)) = *cache {
+                if now.duration_since(cached_time) < Duration::from_secs(1) {
+                    return Some(cached_rtt);
+                }
+            }
+        }
+
+        // Cache is expired or empty, fetch new RTT
+        if let Some(provider) = self.stats_provider.upgrade() {
+            if let Some(new_rtt) = provider.rtt().await {
+                // Update cache with new value
+                let mut cache = self.rtt_cache.lock().await;
+                *cache = Some((new_rtt, now));
+                return Some(new_rtt);
+            }
+        }
+
+        None
+    }
+
+    /// Waits until the buffered amount for the channel at the given index falls below the configured threshold.
+    ///
+    /// This method listens to the bufferedamountlow event from the WebRTC data channel with a timeout fallback.
+    /// If the timeout expires before receiving the event, it manually checks the buffered amount.
+    /// If the buffer is still high, it continues listening for the event.
+    ///
+    /// The threshold is configured via `ChannelConfig::buffer_low_threshold`.
+    ///
+    /// # Arguments
+    /// * `index` - The channel index to monitor
+    /// * `threshold` - The threshold in bytes. If buffer amount is below this, the function returns.
+    /// * `timeout` - Maximum duration to wait for the buffer low event before checking manually
+    ///
+    /// # Returns
+    /// Returns when the buffer low event is triggered or buffer is below threshold, or None if the channel doesn't exist or the sender is dropped.
+    pub async fn wait_buffer_low(&self, index: usize, threshold: usize, timeout: Duration) -> Option<()> {
+        use futures::StreamExt;
+        use futures_util::{select, FutureExt};
+
+        let receiver = self.buffer_low_rx.get(index)?.clone();
+
+        loop {
+            let mut delay = Delay::new(timeout).fuse();
+            let mut rx_lock = receiver.lock().await;
+            let buffered = self.buffered_amount(index).await;
+            if buffered < threshold {
+                return Some(());
+            }
+
+            select! {
+                event = rx_lock.next() => {
+                    // Event received, return
+                    return event;
+                }
+                _ = delay => {
+                    log::info!("Timed out waiting for buffer low event, checking manually");
+                    drop(rx_lock);
+
+                    let buffered = self.buffered_amount(index).await;
+                    if buffered < threshold {
+                        return Some(());
+                    }
+
+                    continue;
+                }
+            }
         }
     }
 }

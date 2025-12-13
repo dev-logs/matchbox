@@ -531,7 +531,7 @@ dependencies = [
  "js-sys",
  "log",
  "matchbox_socket",
- "n0-future",
+ "n0-future 0.1.3",
  "serde",
  "serde_json",
  "tokio",
@@ -1235,7 +1235,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde",
- "spin",
+ "spin 0.9.8",
  "web-time",
 ]
 
@@ -2369,7 +2369,7 @@ dependencies = [
  "iroh-gossip",
  "js-sys",
  "matchbox_socket",
- "n0-future",
+ "n0-future 0.1.3",
  "serde",
  "serde_json",
  "tokio",
@@ -2971,15 +2971,15 @@ dependencies = [
 
 [[package]]
 name = "futures-buffered"
-version = "0.2.11"
+version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe940397c8b744b9c2c974791c2c08bca2c3242ce0290393249e98f215a00472"
+checksum = "a8e0e1f38ec07ba4abbde21eed377082f17ccb988be9d988a5adbf4bafc118fd"
 dependencies = [
  "cordyceps",
  "diatomic-waker",
  "futures-core",
  "pin-project-lite",
- "spin",
+ "spin 0.10.0",
 ]
 
 [[package]]
@@ -3931,7 +3931,7 @@ dependencies = [
  "iroh-quinn-proto",
  "iroh-quinn-udp",
  "iroh-relay",
- "n0-future",
+ "n0-future 0.1.3",
  "netdev",
  "netwatch",
  "pin-project",
@@ -4010,7 +4010,7 @@ dependencies = [
  "iroh",
  "iroh-blake3",
  "iroh-metrics",
- "n0-future",
+ "n0-future 0.1.3",
  "postcard",
  "rand 0.8.5",
  "rand_core 0.6.4",
@@ -4123,7 +4123,7 @@ dependencies = [
  "iroh-quinn",
  "iroh-quinn-proto",
  "lru 0.12.5",
- "n0-future",
+ "n0-future 0.1.3",
  "num_enum",
  "pin-project",
  "pkarr",
@@ -4449,6 +4449,7 @@ dependencies = [
  "js-sys",
  "log",
  "matchbox_protocol",
+ "n0-future 0.3.1",
  "once_cell",
  "serde",
  "serde-wasm-bindgen",
@@ -4589,6 +4590,27 @@ name = "n0-future"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7bb0e5d99e681ab3c938842b96fcb41bf8a7bb4bfdb11ccbd653a7e83e06c794"
+dependencies = [
+ "cfg_aliases",
+ "derive_more 1.0.0",
+ "futures-buffered",
+ "futures-lite",
+ "futures-util",
+ "js-sys",
+ "pin-project",
+ "send_wrapper 0.6.0",
+ "tokio",
+ "tokio-util",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-time",
+]
+
+[[package]]
+name = "n0-future"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c0709ac8235ce13b82bc4d180ee3c42364b90c1a8a628c3422d991d75a728b5"
 dependencies = [
  "cfg_aliases",
  "derive_more 1.0.0",
@@ -4808,7 +4830,7 @@ dependencies = [
  "iroh-quinn-udp",
  "js-sys",
  "libc",
- "n0-future",
+ "n0-future 0.1.3",
  "nested_enum_utils",
  "netdev",
  "netlink-packet-core",
@@ -6685,6 +6707,12 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 dependencies = [
  "portable-atomic",
 ]
+
+[[package]]
+name = "spin"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
 
 [[package]]
 name = "spirv"
