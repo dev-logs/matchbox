@@ -67,7 +67,7 @@ async fn async_main(node_id: Option<String>) {
     let signaller_builder = Arc::new(IrohGossipSignallerBuilder::new().await.unwrap());
     let (mut socket, loop_fut) = WebRtcSocket::builder(room_url)
         .signaller_builder(signaller_builder.clone())
-        .add_reliable_channel()
+        .add_reliable_channel(None)
         .build();
 
     let loop_fut = loop_fut.fuse();

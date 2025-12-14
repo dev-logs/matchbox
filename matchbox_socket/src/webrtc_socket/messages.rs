@@ -212,13 +212,7 @@ impl PeerBuffered {
                 _ = delay => {
                     log::info!("Timed out waiting for buffer low event, checking manually");
                     drop(rx_lock);
-
-                    let buffered = self.buffered_amount(index).await;
-                    if buffered < threshold {
-                        return Some(());
-                    }
-
-                    continue;
+                    break None
                 }
             }
         }
