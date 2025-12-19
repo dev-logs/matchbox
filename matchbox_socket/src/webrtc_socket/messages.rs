@@ -5,6 +5,28 @@ use async_trait::async_trait;
 use futures_timer::Delay;
 use futures_util::lock::Mutex;
 use serde::{Deserialize, Serialize};
+use crate::RtcIceServerConfig;
+
+/// Merges two ICE server configurations.
+/// URLs from the offer config are added to the base config (avoiding duplicates).
+/// Username and credential from the offer config are used if defined, otherwise the base config values are used.
+pub(crate) fn merge_ice_configs(base: &RtcIceServerConfig, offer_config: &RtcIceServerConfig) -> RtcIceServerConfig {
+    let mut merged_urls = base.urls.clone();
+
+    // Add URLs from offer config that aren't already in base config
+    for url in &offer_config.urls {
+        if !merged_urls.contains(url) {
+            merged_urls.push(url.clone());
+        }
+    }
+
+    RtcIceServerConfig {
+        urls: merged_urls,
+        // Use offer config's username/credential if defined, otherwise use base
+        username: offer_config.username.clone().or_else(|| base.username.clone()),
+        credential: offer_config.credential.clone().or_else(|| base.credential.clone()),
+    }
+}
 
 /// Events go from signaling server to peer
 pub type PeerEvent = matchbox_protocol::PeerEvent<PeerSignal>;
@@ -18,7 +40,12 @@ pub enum PeerSignal {
     /// Ice Candidate
     IceCandidate(String),
     /// Offer
-    Offer(String),
+    Offer {
+        /// The SDP offer
+        offer: String,
+        /// Optional ICE server configuration to merge with the accepter's config
+        config: Option<RtcIceServerConfig>
+    },
     /// Answer
     Answer(String),
 }

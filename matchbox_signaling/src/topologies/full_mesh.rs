@@ -131,7 +131,7 @@ impl FullMeshState {
     /// Add a peer, returning peers that already existed
     pub fn add_peer(&mut self, peer: PeerId, sender: SignalingChannel) {
         // Alert all peers of new user
-        let event = Message::Text(JsonPeerEvent::NewPeer(peer).to_string().into());
+        let event = Message::Text(JsonPeerEvent::NewPeer { id: peer, ice_config: None }.to_string().into());
         // Safety: Lock must be scoped/dropped to ensure no deadlock with loop
         let peers = { self.peers.lock().unwrap().clone() };
         peers.keys().for_each(|peer_id| {

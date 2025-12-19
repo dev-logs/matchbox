@@ -10,6 +10,35 @@ use uuid::Uuid;
 )]
 pub struct PeerId(pub Uuid);
 
+/// Configuration options for an ICE server connection.
+/// See also: <https://developer.mozilla.org/en-US/docs/Web/API/RTCIceServer#example>
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RtcIceServerConfig {
+    /// An ICE server instance can have several URLs
+    pub urls: Vec<String>,
+    /// A username for authentication with the ICE server
+    ///
+    /// See: <https://developer.mozilla.org/en-US/docs/Web/API/RTCIceServer/username>
+    pub username: Option<String>,
+    /// A password or token when authenticating with a turn server
+    ///
+    /// See: <https://developer.mozilla.org/en-US/docs/Web/API/RTCIceServer/credential>
+    pub credential: Option<String>,
+}
+
+impl Default for RtcIceServerConfig {
+    fn default() -> Self {
+        Self {
+            urls: vec![
+                "stun:stun.l.google.com:19302".to_string(),
+                "stun:stun1.l.google.com:19302".to_string(),
+            ],
+            username: Default::default(),
+            credential: Default::default(),
+        }
+    }
+}
+
 /// Requests go from peer to signaling server
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PeerRequest<S> {
@@ -23,8 +52,16 @@ pub enum PeerEvent<S: Clone> {
     /// Sent by the server to the connecting peer, immediately after connection
     /// before any other events
     IdAssigned(PeerId),
-    NewPeer(PeerId),
+    /// A new peer has connected
+    NewPeer {
+        /// The ID of the new peer
+        id: PeerId,
+        /// Optional ICE server configuration to merge with the local config
+        ice_config: Option<RtcIceServerConfig>,
+    },
+    /// A peer has disconnected
     PeerLeft(PeerId),
+    /// A signal from another peer
     Signal {
         sender: PeerId,
         data: S,

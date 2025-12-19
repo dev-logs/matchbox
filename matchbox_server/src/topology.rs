@@ -31,7 +31,7 @@ impl SignalingTopology<NoCallbacks, ServerState> for MatchmakingDemoTopology {
 
         // Tell other waiting peers about me!
         let peers = state.add_peer(peer);
-        let event_text = JsonPeerEvent::NewPeer(peer_id).to_string();
+        let event_text = JsonPeerEvent::NewPeer {id: peer_id, ice_config: None}.to_string();
         let event = Message::Text((&event_text).into());
         for peer_id in peers {
             if let Err(e) = state.try_send(peer_id, event.clone()) {
@@ -295,7 +295,7 @@ mod tests {
 
         let new_peer_event = recv_peer_event(&mut client_a).await;
         let peer_uuid = match new_peer_event {
-            JsonPeerEvent::NewPeer(PeerId(peer_uuid)) => peer_uuid.to_string(),
+            JsonPeerEvent::NewPeer {id: PeerId(peer_uuid), ice_config: None} => peer_uuid.to_string(),
             _ => panic!("unexpected event"),
         };
 

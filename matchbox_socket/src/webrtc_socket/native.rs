@@ -1,4 +1,4 @@
-use super::{HandshakeResult, PacketSendError, PeerDataSender, SignallerBuilder, messages::{PeerEvent, PeerRequest}, PeerBuffered, BufferedChannel, StatsProvider};
+use super::{HandshakeResult, PacketSendError, PeerDataSender, SignallerBuilder, messages::{PeerEvent, PeerRequest, merge_ice_configs}, PeerBuffered, BufferedChannel, StatsProvider};
 use webrtc::stats::StatsReportType;
 use crate::{
     RtcIceServerConfig,
@@ -235,7 +235,7 @@ impl Messenger for NativeMessenger {
         signal_peer: SignalPeer,
         mut peer_signal_rx: UnboundedReceiver<PeerSignal>,
         messages_from_peers_tx: Vec<UnboundedSender<(PeerId, Packet)>>,
-        ice_server_config: &RtcIceServerConfig,
+        ice_server_config: RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
         timeout: Duration,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
@@ -246,9 +246,9 @@ impl Messenger for NativeMessenger {
 
             debug!("making offer");
             let (connection, trickle) =
-                create_rtc_peer_connection(signal_peer.clone(), ice_server_config)
+                create_rtc_peer_connection(signal_peer.clone(), &ice_server_config)
                     .await
-                    .unwrap();
+                    .map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
 
             let (data_channel_ready_txs, data_channels_ready_fut) =
                 create_data_channels_ready_fut(channel_configs);
@@ -274,10 +274,13 @@ impl Messenger for NativeMessenger {
             );
 
             // TODO: maybe pass in options? ice restart etc.?
-            let offer = connection.create_offer(None).await.unwrap();
+            let offer = connection.create_offer(None).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
             let sdp = offer.sdp.clone();
-            connection.set_local_description(offer).await.unwrap();
-            signal_peer.send(PeerSignal::Offer(sdp));
+            connection.set_local_description(offer).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
+            signal_peer.send(PeerSignal::Offer {
+                offer: sdp,
+                config: None
+            });
 
             let answer = loop {
                 let signal = match peer_signal_rx.next().await {
@@ -292,7 +295,7 @@ impl Messenger for NativeMessenger {
                     PeerSignal::Answer(answer) => {
                         break answer;
                     }
-                    PeerSignal::Offer(_) => {
+                    PeerSignal::Offer { .. } => {
                         warn!("Got an unexpected Offer, while waiting for Answer. Ignoring.")
                     }
                     PeerSignal::IceCandidate(_) => {
@@ -301,7 +304,7 @@ impl Messenger for NativeMessenger {
                 };
             };
 
-            let remote_description = RTCSessionDescription::answer(answer).unwrap();
+            let remote_description = RTCSessionDescription::answer(answer).map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
             if let Err(e) = connection
                 .set_remote_description(remote_description)
                 .await {
@@ -345,15 +348,43 @@ impl Messenger for NativeMessenger {
         timeout: Duration,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
         async {
+            debug!("handshake_accept");
+
+            // Wait for offer first
+            let (offer_sdp, offer_ice_config) = loop {
+                let signal = match peer_signal_rx.next().await {
+                    Some(signal) => signal,
+                    None => {
+                        warn!("Signal server connection lost in the middle of a handshake");
+                        return Err(PeerError(signal_peer.id, SignalingError::HandshakeFailed));
+                    }
+                };
+                match signal {
+                    PeerSignal::Offer { offer, config } => {
+                        break (offer, config);
+                    }
+                    _ => {
+                        warn!("ignoring other signal!!!");
+                    }
+                }
+            };
+            debug!("received offer");
+
+            // Merge ice configs if offer contains config
+            let merged_ice_config = if let Some(offer_config) = offer_ice_config {
+                merge_ice_configs(ice_server_config, &offer_config)
+            } else {
+                ice_server_config.clone()
+            };
+
             let (to_peer_message_tx, to_peer_message_rx) =
                 new_senders_and_receivers(channel_configs);
             let (peer_disconnected_tx, peer_disconnected_rx) = futures_channel::mpsc::channel(1);
 
-            debug!("handshake_accept");
+            // Create connection with merged config
             let (connection, trickle) =
-                create_rtc_peer_connection(signal_peer.clone(), ice_server_config)
-                    .await
-                    .unwrap();
+                create_rtc_peer_connection(signal_peer.clone(), &merged_ice_config)
+                    .await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
 
             let (data_channel_ready_txs, data_channels_ready_fut) =
                 create_data_channels_ready_fut(channel_configs);
@@ -378,33 +409,14 @@ impl Messenger for NativeMessenger {
                 buffer_low_rxs,
             );
 
-            let offer = loop {
-                let signal = match peer_signal_rx.next().await {
-                    Some(signal) => signal,
-                    None => {
-                        warn!("Signal server connection lost in the middle of a handshake");
-                        return Err(PeerError(signal_peer.id, SignalingError::HandshakeFailed));
-                    }
-                };
-                match signal {
-                    PeerSignal::Offer(offer) => {
-                        break offer;
-                    }
-                    _ => {
-                        warn!("ignoring other signal!!!");
-                    }
-                }
-            };
-            debug!("received offer");
-            let remote_description = RTCSessionDescription::offer(offer).unwrap();
+            let remote_description = RTCSessionDescription::offer(offer_sdp).map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
             connection
                 .set_remote_description(remote_description)
-                .await
-                .unwrap();
+                .await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
 
-            let answer = connection.create_answer(None).await.unwrap();
+            let answer = connection.create_answer(None).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
             signal_peer.send(PeerSignal::Answer(answer.sdp.clone()));
-            connection.set_local_description(answer).await.unwrap();
+            connection.set_local_description(answer).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
 
             let trickle_fut = complete_handshake(
                 signal_peer.id.clone(),
@@ -615,7 +627,7 @@ impl CandidateTrickle {
                         }
                     }
                 }
-                PeerSignal::Offer(_) => {
+                PeerSignal::Offer { .. } => {
                     warn!("Got an unexpected Offer, while waiting for IceCandidate. Ignoring.")
                 }
                 PeerSignal::Answer(_) => {

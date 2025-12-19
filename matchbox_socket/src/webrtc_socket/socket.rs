@@ -15,26 +15,14 @@ use futures_channel::mpsc::{SendError, TrySendError, UnboundedReceiver, Unbounde
 use log::{debug, error, info};
 use matchbox_protocol::PeerId;
 use std::{collections::HashMap, future::ready, pin::Pin, sync::Arc, task::Poll, time::Duration};
+use serde::{Deserialize, Serialize};
 use tokio_util::{
     compat::TokioAsyncWriteCompatExt,
     io::{CopyToBytes, SinkWriter},
 };
 
-/// Configuration options for an ICE server connection.
-/// See also: <https://developer.mozilla.org/en-US/docs/Web/API/RTCIceServer#example>
-#[derive(Debug, Clone)]
-pub struct RtcIceServerConfig {
-    /// An ICE server instance can have several URLs
-    pub urls: Vec<String>,
-    /// A username for authentication with the ICE server
-    ///
-    /// See: <https://developer.mozilla.org/en-US/docs/Web/API/RTCIceServer/username>
-    pub username: Option<String>,
-    /// A password or token when authenticating with a turn server
-    ///
-    /// See: <https://developer.mozilla.org/en-US/docs/Web/API/RTCIceServer/credential>
-    pub credential: Option<String>,
-}
+// Re-export RtcIceServerConfig from matchbox_protocol
+pub use matchbox_protocol::RtcIceServerConfig;
 
 /// Configuration options for a data channel
 /// See also: <https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel>
@@ -69,19 +57,6 @@ impl ChannelConfig {
             ordered: true,
             max_retransmits: None,
             buffer_low_threshold: low_amount,
-        }
-    }
-}
-
-impl Default for RtcIceServerConfig {
-    fn default() -> Self {
-        Self {
-            urls: vec![
-                "stun:stun.l.google.com:19302".to_string(),
-                "stun:stun1.l.google.com:19302".to_string(),
-            ],
-            username: Default::default(),
-            credential: Default::default(),
         }
     }
 }

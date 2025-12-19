@@ -233,10 +233,12 @@ impl IrohGossipSignallerBuilder {
 
                                 if matchbox_id < self.matchbox_id {
                                     info!("Sending NewPeer event for smaller id");
-                                    event_send.send(PeerEvent::NewPeer(matchbox_id)).await?;
-                                } else {
+                                    event_send.send(PeerEvent::NewPeer {id: matchbox_id, ice_config: None}).await?;
+                                }
+                                else {
                                     info!("Not sending NewPeer event for larger id");
                                 }
+
                                 // on new peer, send gossip message to ensure new peer has our iroh id
                                 self.send_gossip_message(&gossip_send).await?;
                             }

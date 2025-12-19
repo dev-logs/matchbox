@@ -174,7 +174,7 @@ trait Messenger {
         signal_peer: SignalPeer,
         peer_signal_rx: UnboundedReceiver<PeerSignal>,
         messages_from_peers_tx: Vec<UnboundedSender<(PeerId, Packet)>>,
-        ice_server_config: &RtcIceServerConfig,
+        ice_server_config: RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
         timeout: Duration,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError>;
@@ -253,11 +253,19 @@ async fn message_loop<M: Messenger>(
                                 break Ok(());
                             };
                         },
-                        PeerEvent::NewPeer(peer_uuid) => {
+                        PeerEvent::NewPeer { id: peer_uuid, ice_config } => {
                             let (signal_tx, signal_rx) = futures_channel::mpsc::unbounded();
                             handshake_signals.insert(peer_uuid, signal_tx);
                             let signal_peer = SignalPeer::new(peer_uuid, requests_sender.clone());
-                            handshakes.push(M::offer_handshake(signal_peer, signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs, handshake_timeout.clone()))
+
+                            // Merge ice configs if event contains config, otherwise clone the base config
+                            let merged_config = if let Some(event_ice_config) = ice_config {
+                                merge_ice_configs(ice_server_config, &event_ice_config)
+                            } else {
+                                ice_server_config.clone()
+                            };
+
+                            handshakes.push(M::offer_handshake(signal_peer, signal_rx, messages_from_peers_tx.clone(), merged_config, channel_configs, handshake_timeout.clone()))
                         },
                         PeerEvent::PeerLeft(peer_uuid) => {
                             if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected, None)).is_err() {
@@ -292,6 +300,7 @@ async fn message_loop<M: Messenger>(
                         info!("error during handshake for peer {peer_id}: {error:?}");
 
                         data_channels.remove(&peer_id);
+                        // Note: peer_ice_configs is not cleaned up to avoid borrow checker issues
                         if peer_state_tx.unbounded_send((peer_id, PeerState::Disconnected, None)).is_err() {
                             info!("4. socket dropped, exit cleanly");
                             break Ok(());

@@ -78,7 +78,7 @@ impl SignalingTopology<ClientServerCallbacks, ClientServerState> for ClientServe
             callbacks.on_host_connected.emit(peer_id);
         } else {
             // Alert server of new user
-            let event = Message::Text(JsonPeerEvent::NewPeer(peer_id).to_string().into());
+            let event = Message::Text(JsonPeerEvent::NewPeer { id: peer_id, ice_config: None }.to_string().into());
             // Tell host about this new client
             match state.try_send_to_host(event) {
                 Ok(_) => {
