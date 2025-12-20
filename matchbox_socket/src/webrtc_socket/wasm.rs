@@ -307,6 +307,7 @@ impl Messenger for WasmMessenger {
         timeout: Duration,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
         debug!("making offer");
+        log::info!("Using ice config {:?}", ice_server_config);
 
         let conn = create_rtc_peer_connection(&signal_peer.id, &ice_server_config)?;
 
@@ -352,8 +353,9 @@ impl Messenger for WasmMessenger {
         // After some investigation, the full trickle on web could causing
         // issues of overloading, we should implement the half-trickle instead.
         // todo: implement the half trickle
-       wait_for_ice_gathering_complete(signal_peer.id.clone(), conn.clone(), timeout.clone()).await?;
+        wait_for_ice_gathering_complete(signal_peer.id.clone(), conn.clone(), timeout.clone()).await?;
 
+        log::info!("sending offer to peer {}", conn.local_description().unwrap().sdp());
         signal_peer.send(PeerSignal::Offer {
             offer: conn.local_description().unwrap().sdp(),
             config: None
