@@ -259,12 +259,7 @@ async fn message_loop<M: Messenger>(
                             let signal_peer = SignalPeer::new(peer_uuid, requests_sender.clone());
 
                             // Merge ice configs if event contains config, otherwise clone the base config
-                            let merged_config = if let Some(event_ice_config) = ice_config {
-                                merge_ice_configs(ice_server_config, &event_ice_config)
-                            } else {
-                                ice_server_config.clone()
-                            };
-
+                            let merged_config = ice_config.unwrap_or(ice_server_config.clone());
                             handshakes.push(M::offer_handshake(signal_peer, signal_rx, messages_from_peers_tx.clone(), merged_config, channel_configs, handshake_timeout.clone()))
                         },
                         PeerEvent::PeerLeft(peer_uuid) => {
