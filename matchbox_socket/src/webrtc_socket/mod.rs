@@ -24,7 +24,7 @@ use std::usize::MAX;
 use crate::webrtc_socket::batch::Batch;
 use crate::webrtc_socket::error::PeerError;
 
-pub static MAX_PACKET_SIZE: usize = 1024 * 64;
+pub static MAX_PACKET_SIZE: usize = 1024 * 63;
 
 cfg_if! {
     if #[cfg(target_arch = "wasm32")] {
@@ -338,6 +338,7 @@ async fn message_loop<M: Messenger>(
                         };
 
                         if packet.len() > MAX_PACKET_SIZE && data_channel.is_reliable() {
+                            log::info!("Packet {} too large, will split into batches", packet.len());
                             let _ = data_channel.send(Batch::new(peer, packet.len()).as_bytes());
                             packet.chunks(MAX_PACKET_SIZE).for_each(|chunk| {
                                 let _ = data_channel.send(chunk.into());
