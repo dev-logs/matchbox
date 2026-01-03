@@ -24,7 +24,7 @@ use std::usize::MAX;
 use crate::webrtc_socket::batch::Batch;
 use crate::webrtc_socket::error::PeerError;
 
-pub static MAX_PACKET_SIZE: usize = 1024 * 64;
+pub static MAX_PACKET_SIZE: usize = 1024 * 63;
 
 cfg_if! {
     if #[cfg(target_arch = "wasm32")] {
@@ -259,12 +259,7 @@ async fn message_loop<M: Messenger>(
                             let signal_peer = SignalPeer::new(peer_uuid, requests_sender.clone());
 
                             // Merge ice configs if event contains config, otherwise clone the base config
-                            let merged_config = if let Some(event_ice_config) = ice_config {
-                                merge_ice_configs(ice_server_config, &event_ice_config)
-                            } else {
-                                ice_server_config.clone()
-                            };
-
+                            let merged_config = ice_config.unwrap_or(ice_server_config.clone());
                             handshakes.push(M::offer_handshake(signal_peer, signal_rx, messages_from_peers_tx.clone(), merged_config, channel_configs, handshake_timeout.clone()))
                         },
                         PeerEvent::PeerLeft(peer_uuid) => {
@@ -343,6 +338,7 @@ async fn message_loop<M: Messenger>(
                         };
 
                         if packet.len() > MAX_PACKET_SIZE && data_channel.is_reliable() {
+                            log::info!("Packet {} too large, will split into batches", packet.len());
                             let _ = data_channel.send(Batch::new(peer, packet.len()).as_bytes());
                             packet.chunks(MAX_PACKET_SIZE).for_each(|chunk| {
                                 let _ = data_channel.send(chunk.into());

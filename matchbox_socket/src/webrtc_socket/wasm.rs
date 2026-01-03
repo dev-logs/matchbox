@@ -453,11 +453,7 @@ impl Messenger for WasmMessenger {
         debug!("received offer");
 
         // Merge ice configs if offer contains config
-        let merged_ice_config = if let Some(offer_config) = offer_ice_config {
-            merge_ice_configs(&ice_server_config, &offer_config)
-        } else {
-            ice_server_config.clone()
-        };
+        let merged_ice_config = offer_ice_config.unwrap_or(ice_server_config.clone());
 
         // Create connection with merged config
         let conn = create_rtc_peer_connection(&signal_peer.id, &merged_ice_config)?;

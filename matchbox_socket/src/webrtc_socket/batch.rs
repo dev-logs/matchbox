@@ -35,9 +35,6 @@ impl Batch {
 
         let cfg = standard();
         let (mut result, _) = bincode::decode_from_slice::<Self, Configuration>(serialized_data, cfg).ok()?;
-        if result.peer_id != *peer_id {
-            return None
-        }
 
         result.buffer = Vec::with_capacity(result.size);
         Some(result)
