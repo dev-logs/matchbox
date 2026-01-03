@@ -233,11 +233,9 @@ impl PeerBuffered {
 
             select! {
                 event = rx_lock.next() => {
-                    // Event received, return
                     return event;
                 }
                 _ = delay => {
-                    log::info!("Timed out waiting for buffer low event, checking manually");
                     drop(rx_lock);
                     break None
                 }
