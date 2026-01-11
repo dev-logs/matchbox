@@ -8,3 +8,6 @@ crates/*/target
 *.code-workspace
 .DS_Store
 .idea
+.claude
+.dev
+plan.md

@@ -20,7 +20,7 @@ use futures::{
     future::{Fuse, FusedFuture},
     stream::FuturesUnordered,
 };
-use futures_channel::mpsc::{Receiver, Sender, TrySendError, UnboundedReceiver, UnboundedSender};
+use futures_channel::{mpsc::{Receiver, Sender, TrySendError, UnboundedReceiver, UnboundedSender}, oneshot};
 use futures_timer::Delay;
 use futures_util::{lock::Mutex, select};
 use log::{debug, error, info, trace, warn};
@@ -31,6 +31,7 @@ use std::sync::Weak;
 use futures::executor::block_on;
 use webrtc::{api::APIBuilder, data_channel::{RTCDataChannel, data_channel_init::RTCDataChannelInit}, ice_transport::{
     ice_candidate::{RTCIceCandidate, RTCIceCandidateInit},
+    ice_gatherer_state::RTCIceGathererState,
     ice_server::RTCIceServer,
 }, peer_connection::{
     RTCPeerConnection, configuration::RTCConfiguration,
@@ -275,10 +276,11 @@ impl Messenger for NativeMessenger {
 
             // TODO: maybe pass in options? ice restart etc.?
             let offer = connection.create_offer(None).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
-            let sdp = offer.sdp.clone();
             connection.set_local_description(offer).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
+            wait_for_ice_gathering_complete(signal_peer.id, &connection, timeout).await?;
+            let offer_sdp = connection.local_description().await.unwrap().sdp;
             signal_peer.send(PeerSignal::Offer {
-                offer: sdp,
+                offer: offer_sdp,
                 config: None
             });
 
@@ -411,8 +413,10 @@ impl Messenger for NativeMessenger {
                 .await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
 
             let answer = connection.create_answer(None).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
-            signal_peer.send(PeerSignal::Answer(answer.sdp.clone()));
             connection.set_local_description(answer).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
+            wait_for_ice_gathering_complete(signal_peer.id, &connection, timeout).await?;
+            let answer_sdp = connection.local_description().await.unwrap().sdp;
+            signal_peer.send(PeerSignal::Answer(answer_sdp));
 
             let trickle_fut = complete_handshake(
                 signal_peer.id.clone(),
@@ -538,6 +542,7 @@ async fn complete_handshake<T: Future<Output = ()>>(
                 break;
             },
             _ = timeout => {
+                warn!("Peer {peer_id} handshake timeout");
                 return Err(PeerError(peer_id, SignalingError::HandshakeFailed));
             },
             result = trickle_fut => {
@@ -548,6 +553,44 @@ async fn complete_handshake<T: Future<Output = ()>>(
     }
 
     Ok(trickle_fut)
+}
+
+async fn wait_for_ice_gathering_complete(
+    peer_id: PeerId,
+    connection: &Arc<RTCPeerConnection>,
+    timeout: Duration,
+) -> Result<(), PeerError> {
+    let (tx, rx) = oneshot::channel();
+    let tx = Arc::new(Mutex::new(Some(tx)));
+
+    let tx_clone = tx.clone();
+    connection.on_ice_gathering_state_change(Box::new(move |state: RTCIceGathererState| {
+        if state == RTCIceGathererState::Complete {
+            let tx_clone = tx_clone.clone();
+            Box::pin(async move {
+                if let Some(sender) = tx_clone.lock().await.take() {
+                    let _ = sender.send(());
+                }
+            })
+        } else {
+            Box::pin(async {})
+        }
+    }));
+
+    let mut delay = Delay::new(timeout).fuse();
+    let mut rx = rx.fuse();
+
+    select! {
+        _ = delay => {
+            warn!("timeout waiting for ice gathering to complete");
+            return Err(PeerError(peer_id, SignalingError::HandshakeFailed));
+        },
+        _ = rx => {
+            info!("Ice gathering completed");
+        }
+    }
+
+    Ok(())
 }
 
 struct CandidateTrickle {
