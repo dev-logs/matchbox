@@ -15,7 +15,6 @@ use futures_channel::mpsc::{SendError, TrySendError, UnboundedReceiver, Unbounde
 use log::{debug, error, info};
 use matchbox_protocol::PeerId;
 use std::{collections::HashMap, future::ready, pin::Pin, sync::Arc, task::Poll, time::Duration};
-use serde::{Deserialize, Serialize};
 use tokio_util::{
     compat::TokioAsyncWriteCompatExt,
     io::{CopyToBytes, SinkWriter},
@@ -85,6 +84,8 @@ pub(crate) struct SocketConfig {
     pub(crate) keep_alive_interval: Option<Duration>,
     /// Timeout for peer handshake
     pub(crate) webrtc_handshake_timeout: Duration,
+    /// Whether to ensure relay (TURN) candidates are gathered before timeout
+    pub(crate) ensure_relay_candidates: bool,
 }
 
 /// Builder for [`WebRtcSocket`]s.
@@ -113,6 +114,7 @@ impl WebRtcSocketBuilder {
                 attempts: Some(3),
                 keep_alive_interval: Some(Duration::from_secs(10)),
                 webrtc_handshake_timeout: Duration::from_secs(30),
+                ensure_relay_candidates: false,
             },
             signaller_builder: None,
         }
@@ -173,6 +175,22 @@ impl WebRtcSocketBuilder {
     /// Timeout for peer handshake
     pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
         self.config.webrtc_handshake_timeout = timeout;
+        self
+    }
+
+    /// Ensure relay (TURN) candidates are gathered before ICE gathering timeout.
+    ///
+    /// When enabled, ICE gathering will succeed on timeout only if at least one
+    /// relay candidate was gathered. This is useful for connections that must
+    /// work through TURN servers (e.g., in restrictive network environments).
+    ///
+    /// When disabled (default), ICE gathering will proceed with whatever
+    /// candidates are available when the timeout occurs.
+    ///
+    /// **Note**: A TURN server must be configured in the ICE server config for
+    /// relay candidates to be gathered.
+    pub fn ensure_relay_candidates(mut self, ensure: bool) -> Self {
+        self.config.ensure_relay_candidates = ensure;
         self
     }
 
@@ -850,6 +868,7 @@ async fn run_socket(
         channels,
         config.keep_alive_interval,
         config.webrtc_handshake_timeout,
+        config.ensure_relay_candidates,
     );
 
     let mut message_loop_done = Box::pin(message_loop_fut.fuse());

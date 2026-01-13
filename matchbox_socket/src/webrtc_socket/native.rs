@@ -1,4 +1,4 @@
-use super::{HandshakeResult, PacketSendError, PeerDataSender, SignallerBuilder, messages::{PeerEvent, PeerRequest, merge_ice_configs}, PeerBuffered, BufferedChannel, StatsProvider};
+use super::{HandshakeResult, PacketSendError, PeerDataSender, SignallerBuilder, messages::{PeerEvent, PeerRequest}, PeerBuffered, BufferedChannel, StatsProvider};
 use webrtc::stats::StatsReportType;
 use crate::{
     RtcIceServerConfig,
@@ -20,14 +20,13 @@ use futures::{
     future::{Fuse, FusedFuture},
     stream::FuturesUnordered,
 };
-use futures_channel::{mpsc, mpsc::{Receiver, Sender, TrySendError, UnboundedReceiver, UnboundedSender}, oneshot};
+use futures_channel::{mpsc, mpsc::{Receiver, Sender, TrySendError, UnboundedReceiver, UnboundedSender}};
 use futures_timer::Delay;
-use futures_util::{lock::Mutex, select, SinkExt};
-use log::{debug, error, info, set_max_level, trace, warn};
+use futures_util::{lock::Mutex, select};
+use log::{debug, error, info, trace, warn};
 use matchbox_protocol::PeerId;
 use std::{pin::Pin, sync::Arc, time::Duration};
 use std::ops::{Deref, DerefMut};
-use std::sync::Weak;
 use futures::executor::block_on;
 use webrtc::{api::APIBuilder, data_channel::{RTCDataChannel, data_channel_init::RTCDataChannelInit}, ice_transport::{
     ice_candidate::{RTCIceCandidate, RTCIceCandidateInit},
@@ -39,8 +38,6 @@ use webrtc::{api::APIBuilder, data_channel::{RTCDataChannel, data_channel_init::
 }, Error};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
-use webrtc::ice::mdns::MulticastDnsMode;
-use webrtc::ice::network_type::NetworkType;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use crate::webrtc_socket::batch::Batch;
 use crate::webrtc_socket::error::PeerError;
@@ -243,6 +240,7 @@ impl Messenger for NativeMessenger {
         ice_server_config: RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
         timeout: Duration,
+        ensure_relay: bool,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
         async {
             let (to_peer_message_tx, to_peer_message_rx) =
@@ -281,7 +279,7 @@ impl Messenger for NativeMessenger {
             // TODO: maybe pass in options? ice restart etc.?
             let offer = connection.create_offer(None).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
             connection.set_local_description(offer).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
-            wait_for_ice_gathering_complete(signal_peer.id, &connection, timeout).await?;
+            wait_for_ice_gathering_complete(signal_peer.id, &connection, timeout, ensure_relay).await?;
             let offer_sdp = connection.local_description().await.unwrap().sdp;
             info!("offer sdp: {}", offer_sdp);
             signal_peer.send(PeerSignal::Offer {
@@ -354,6 +352,7 @@ impl Messenger for NativeMessenger {
         ice_server_config: &RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
         timeout: Duration,
+        ensure_relay: bool,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
         async {
             debug!("handshake_accept");
@@ -420,7 +419,7 @@ impl Messenger for NativeMessenger {
 
             let answer = connection.create_answer(None).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
             connection.set_local_description(answer).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
-            wait_for_ice_gathering_complete(signal_peer.id, &connection, timeout).await?;
+            wait_for_ice_gathering_complete(signal_peer.id, &connection, timeout, ensure_relay).await?;
             let answer_sdp = connection.local_description().await.unwrap().sdp;
             info!("answer sdp: {}", answer_sdp);
             signal_peer.send(PeerSignal::Answer(answer_sdp));
@@ -562,12 +561,19 @@ async fn complete_handshake<T: Future<Output = ()>>(
     Ok(trickle_fut)
 }
 
+/// Check if an ICE candidate is a relay (TURN) candidate.
+fn is_relay_candidate(candidate: &str) -> bool {
+    candidate.contains("typ relay")
+}
+
 async fn wait_for_ice_gathering_complete(
     peer_id: PeerId,
     connection: &Arc<RTCPeerConnection>,
     timeout: Duration,
-) -> Result<(), PeerError> {
+    ensure_relay: bool,
+) -> Result<bool, PeerError> {
     let (tx, mut rx) = mpsc::channel(1);
+    let has_relay = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let tx_clone = tx.clone();
     connection.on_ice_gathering_state_change(Box::new(move |state: RTCIceGathererState| {
@@ -581,20 +587,43 @@ async fn wait_for_ice_gathering_complete(
         }
     }));
 
+    // Track relay candidates if ensure_relay is enabled
+    if ensure_relay {
+        let has_relay_clone = has_relay.clone();
+        connection.on_ice_candidate(Box::new(move |candidate| {
+            if let Some(c) = candidate {
+                if let Ok(json) = c.to_json() {
+                    if is_relay_candidate(&json.candidate) {
+                        has_relay_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                        info!("Relay candidate gathered");
+                    }
+                }
+            }
+            Box::pin(async {})
+        }));
+    }
+
     let mut delay = Delay::new(Duration::from_millis((timeout.as_millis() as u64).min(10000))).fuse();
     let mut rx = rx.next().fuse();
 
     select! {
         _ = delay => {
-            warn!("timeout waiting for ice gathering to complete");
-            return Err(PeerError(peer_id, SignalingError::HandshakeFailed));
+            if has_relay.load(std::sync::atomic::Ordering::SeqCst) {
+                info!("ICE gathering timeout, but relay candidates available - proceeding");
+                return Ok(false);  // Timeout but have relay
+            } else if !ensure_relay {
+                warn!("ICE gathering timeout - proceeding with available candidates");
+                return Ok(false);  // Timeout, relay not required
+            } else {
+                warn!("ICE gathering timeout without relay candidates");
+                return Err(PeerError(peer_id, SignalingError::HandshakeFailed));
+            }
         },
         _ = rx => {
             info!("Ice gathering completed");
+            return Ok(true);  // Complete
         }
     }
-
-    Ok(())
 }
 
 struct CandidateTrickle {

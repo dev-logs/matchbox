@@ -12,7 +12,7 @@ use futures::{Future, FutureExt, StreamExt, future::Either, stream::FuturesUnord
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures_timer::Delay;
 use futures_util::select;
-use log::{debug, error, warn, info};
+use log::{debug, error, info};
 use matchbox_protocol::PeerId;
 pub use messages::*;
 pub(crate) use socket::MessageLoopChannels;
@@ -20,7 +20,6 @@ pub use socket::{
     ChannelConfig, PeerState, RtcIceServerConfig, WebRtcChannel, WebRtcSocket, WebRtcSocketBuilder,
 };
 use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
-use std::usize::MAX;
 use crate::webrtc_socket::batch::Batch;
 use crate::webrtc_socket::error::PeerError;
 
@@ -177,6 +176,7 @@ trait Messenger {
         ice_server_config: RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
         timeout: Duration,
+        ensure_relay: bool,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError>;
 
     async fn accept_handshake(
@@ -186,6 +186,7 @@ trait Messenger {
         ice_server_config: &RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
         timeout: Duration,
+        ensure_relay: bool,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError>;
 
     async fn peer_loop(peer_uuid: PeerId, handshake_meta: Self::HandshakeMeta) -> PeerId;
@@ -198,6 +199,7 @@ async fn message_loop<M: Messenger>(
     channels: MessageLoopChannels,
     keep_alive_interval: Option<Duration>,
     handshake_timeout: Duration,
+    ensure_relay_candidates: bool,
 ) -> Result<(), SignalingError> {
     let MessageLoopChannels {
         requests_sender,
@@ -260,7 +262,7 @@ async fn message_loop<M: Messenger>(
 
                             // Merge ice configs if event contains config, otherwise clone the base config
                             let merged_config = ice_config.unwrap_or(ice_server_config.clone());
-                            handshakes.push(M::offer_handshake(signal_peer, signal_rx, messages_from_peers_tx.clone(), merged_config, channel_configs, handshake_timeout.clone()))
+                            handshakes.push(M::offer_handshake(signal_peer, signal_rx, messages_from_peers_tx.clone(), merged_config, channel_configs, handshake_timeout.clone(), ensure_relay_candidates))
                         },
                         PeerEvent::PeerLeft(peer_uuid) => {
                             if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected, None)).is_err() {
@@ -276,7 +278,7 @@ async fn message_loop<M: Messenger>(
                             let signal_tx = handshake_signals.entry(sender).or_insert_with(|| {
                                 let (from_peer_tx, peer_signal_rx) = futures_channel::mpsc::unbounded();
                                 let signal_peer = SignalPeer::new(sender, requests_sender.clone());
-                                handshakes.push(M::accept_handshake(signal_peer, peer_signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs, handshake_timeout.clone()));
+                                handshakes.push(M::accept_handshake(signal_peer, peer_signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs, handshake_timeout.clone(), ensure_relay_candidates));
                                 from_peer_tx
                             });
 

@@ -1,4 +1,4 @@
-use super::{HandshakeResult, PacketSendError, PeerDataSender, SignallerBuilder, error::JsErrorExt, messages::{PeerEvent, PeerRequest, merge_ice_configs}, BufferedChannel, StatsProvider};
+use super::{HandshakeResult, PacketSendError, PeerDataSender, SignallerBuilder, error::JsErrorExt, messages::{PeerEvent, PeerRequest}, BufferedChannel, StatsProvider};
 use crate::webrtc_socket::{
     ChannelConfig, Messenger, Packet, RtcIceServerConfig, Signaller, error::SignalingError,
     messages::PeerSignal, signal_peer::SignalPeer, socket::create_data_channels_ready_fut,
@@ -305,6 +305,7 @@ impl Messenger for WasmMessenger {
         ice_server_config: RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
         timeout: Duration,
+        ensure_relay: bool,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
         debug!("making offer");
         log::info!("Using ice config {:?}", ice_server_config);
@@ -353,7 +354,7 @@ impl Messenger for WasmMessenger {
         // After some investigation, the full trickle on web could causing
         // issues of overloading, we should implement the half-trickle instead.
         // todo: implement the half trickle
-        wait_for_ice_gathering_complete(signal_peer.id.clone(), conn.clone(), timeout.clone()).await?;
+        wait_for_ice_gathering_complete(signal_peer.id.clone(), conn.clone(), timeout.clone(), ensure_relay).await?;
 
         log::info!("sending offer to peer {}", conn.local_description().unwrap().sdp());
         let offer_sdp = conn.local_description().unwrap().sdp();
@@ -423,6 +424,7 @@ impl Messenger for WasmMessenger {
         ice_server_config: &RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
         timeout: Duration,
+        ensure_relay: bool,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
         debug!("handshake_accept");
 
@@ -517,7 +519,7 @@ impl Messenger for WasmMessenger {
 
         // todo: implement the full trickle on accept handshake side
         // the offer side will be gathering all ice before sent, and answer side will use full trickle
-        wait_for_ice_gathering_complete(signal_peer.id.clone(), conn.clone(), timeout.clone()).await?;
+        wait_for_ice_gathering_complete(signal_peer.id.clone(), conn.clone(), timeout.clone(), ensure_relay).await?;
 
         let sdp_answer = conn.local_description().unwrap().sdp();
         info!("answer sdp {sdp_answer}");
@@ -692,18 +694,24 @@ fn create_rtc_peer_connection(peer_id: &PeerId, ice_server_config: &RtcIceServer
     Ok(connection)
 }
 
-async fn wait_for_ice_gathering_complete(peer_id: PeerId, conn: Arc<RtcConnectionWrapper>, timeout: Duration) -> Result<(), PeerError> {
+/// Check if an ICE candidate is a relay (TURN) candidate.
+fn is_relay_candidate(candidate: &str) -> bool {
+    candidate.contains("typ relay")
+}
+
+async fn wait_for_ice_gathering_complete(peer_id: PeerId, conn: Arc<RtcConnectionWrapper>, timeout: Duration, ensure_relay: bool) -> Result<bool, PeerError> {
     if conn.ice_gathering_state() == RtcIceGatheringState::Complete {
         debug!("Ice gathering already completed");
-        return Ok(());
+        return Ok(true);
     }
 
     let (mut tx, mut rx) = futures_channel::mpsc::channel(1);
+    let has_relay = std::rc::Rc::new(std::cell::RefCell::new(false));
 
     let conn_clone = conn.clone();
     let onstatechange: Box<dyn FnMut(JsValue)> = Box::new(move |_| {
         if conn_clone.ice_gathering_state() == RtcIceGatheringState::Complete {
-            tx.try_send(()).unwrap();
+            let _ = tx.try_send(());
         }
     });
 
@@ -711,21 +719,52 @@ async fn wait_for_ice_gathering_complete(peer_id: PeerId, conn: Arc<RtcConnectio
 
     conn.set_onicegatheringstatechange(Some(onstatechange.as_ref().unchecked_ref()));
 
+    // Track relay candidates if ensure_relay is enabled
+    let _onicecandidate_closure = if ensure_relay {
+        let has_relay_clone = has_relay.clone();
+        let onicecandidate: Box<dyn FnMut(RtcPeerConnectionIceEvent)> = Box::new(
+            move |event: RtcPeerConnectionIceEvent| {
+                if let Some(candidate) = event.candidate() {
+                    let candidate_str = candidate.candidate();
+                    if is_relay_candidate(&candidate_str) {
+                        *has_relay_clone.borrow_mut() = true;
+                        info!("Relay candidate gathered");
+                    }
+                }
+            },
+        );
+        let closure = Closure::wrap(onicecandidate);
+        conn.set_onicecandidate(Some(closure.as_ref().unchecked_ref()));
+        Some(closure)
+    } else {
+        None
+    };
+
     let mut delay = Delay::new(Duration::from_millis((timeout.as_millis() as u64).min(10000))).fuse();
 
-    select! {
+    let result = select! {
         _ = delay => {
-            warn!("timeout waiting for ice gathering to complete");
-            return Err(PeerError(peer_id, SignalingError::HandshakeFailed));
+            if *has_relay.borrow() {
+                info!("ICE gathering timeout, but relay candidates available - proceeding");
+                Ok(false)  // Timeout but have relay
+            } else if !ensure_relay {
+                warn!("ICE gathering timeout - proceeding with available candidates");
+                Ok(false)  // Timeout, relay not required
+            } else {
+                warn!("ICE gathering timeout without relay candidates");
+                Err(PeerError(peer_id, SignalingError::HandshakeFailed))
+            }
         },
         _ = rx.next() => {
             info!("Ice gathering completed");
+            Ok(true)  // Complete
         }
-    }
+    };
 
     conn.set_onicegatheringstatechange(None);
+    // Note: We don't clear onicecandidate here as it might be set later by complete_handshake
 
-    Ok(())
+    result
 }
 
 fn create_data_channels(
