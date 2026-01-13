@@ -48,6 +48,9 @@ pub enum PeerSignal {
     },
     /// Answer
     Answer(String),
+    /// Request peer to retry connection with relay-only mode (TURN)
+    /// Sent by offerer when data channel timeout occurs with relay_fallback_on_timeout enabled
+    RetryWithRelay,
 }
 
 #[cfg(not(target_family = "wasm"))]

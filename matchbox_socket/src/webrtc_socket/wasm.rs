@@ -306,6 +306,8 @@ impl Messenger for WasmMessenger {
         channel_configs: &[ChannelConfig],
         timeout: Duration,
         ensure_relay: bool,
+        _relay_fallback_on_timeout: bool,
+        _relay_retry_timeout: Duration,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
         debug!("making offer");
         log::info!("Using ice config {:?}", ice_server_config);
@@ -425,6 +427,8 @@ impl Messenger for WasmMessenger {
         channel_configs: &[ChannelConfig],
         timeout: Duration,
         ensure_relay: bool,
+        _relay_fallback_on_timeout: bool,
+        _relay_retry_timeout: Duration,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
         debug!("handshake_accept");
 

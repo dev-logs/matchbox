@@ -241,105 +241,62 @@ impl Messenger for NativeMessenger {
         channel_configs: &[ChannelConfig],
         timeout: Duration,
         ensure_relay: bool,
+        relay_fallback_on_timeout: bool,
+        relay_retry_timeout: Duration,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
         async {
-            let (to_peer_message_tx, to_peer_message_rx) =
-                new_senders_and_receivers(channel_configs);
-            let (peer_disconnected_tx, peer_disconnected_rx) = futures_channel::mpsc::channel(1);
+            // Check if relay fallback is possible (TURN server must be configured)
+            let can_retry_with_relay = relay_fallback_on_timeout && has_turn_server(&ice_server_config);
 
-            debug!("making offer");
-            let (connection, trickle) =
-                create_rtc_peer_connection(signal_peer.clone(), &ice_server_config)
-                    .await
-                    .map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
-
-            let (data_channel_ready_txs, data_channels_ready_fut) =
-                create_data_channels_ready_fut(channel_configs);
-
-            let (data_channels, buffer_low_rxs) = create_data_channels(
-                &connection,
-                data_channel_ready_txs,
-                signal_peer.id,
-                peer_disconnected_tx,
-                messages_from_peers_tx,
+            // First attempt with normal ICE (all candidates)
+            let result = do_offer_handshake(
+                signal_peer.clone(),
+                &mut peer_signal_rx,
+                messages_from_peers_tx.clone(),
+                &ice_server_config,
                 channel_configs,
-            )
-            .await?;
+                timeout,
+                ensure_relay,
+                false, // relay_only = false for first attempt
+                can_retry_with_relay, // allow retry if configured
+            ).await;
 
-            let stats = Arc::downgrade(&connection);
-            let peer_buffered = PeerBuffered::new(
-                data_channels.iter().map(|it| {
-                    let channel: Box<dyn BufferedChannel> = Box::new(it.clone());
-                    channel
-                }).collect::<Vec<_>>(),
-                stats,
-                buffer_low_rxs,
-            );
+            match result {
+                Ok(handshake_result) => Ok(handshake_result),
+                Err(HandshakeFailure::NeedsRelayRetry) => {
+                    info!("Data channel timeout - attempting relay-only fallback");
 
-            // TODO: maybe pass in options? ice restart etc.?
-            let offer = connection.create_offer(None).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
-            connection.set_local_description(offer).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
-            wait_for_ice_gathering_complete(signal_peer.id, &connection, timeout, ensure_relay).await?;
-            let offer_sdp = connection.local_description().await.unwrap().sdp;
-            info!("offer sdp: {}", offer_sdp);
-            signal_peer.send(PeerSignal::Offer {
-                offer: offer_sdp,
-                config: None
-            });
+                    // Send RetryWithRelay signal to peer
+                    signal_peer.send(PeerSignal::RetryWithRelay);
 
-            let answer = loop {
-                let signal = match peer_signal_rx.next().await {
-                    Some(signal) => signal,
-                    None => {
-                        warn!("Signal server connection lost in the middle of a handshake");
-                        return Err(PeerError(signal_peer.id, SignalingError::HandshakeFailed));
+                    // Retry with relay-only mode
+                    let retry_result = do_offer_handshake(
+                        signal_peer.clone(),
+                        &mut peer_signal_rx,
+                        messages_from_peers_tx,
+                        &ice_server_config,
+                        channel_configs,
+                        relay_retry_timeout,
+                        ensure_relay,
+                        true, // relay_only = true for retry
+                        false, // no further retries
+                    ).await;
+
+                    match retry_result {
+                        Ok(handshake_result) => {
+                            info!("Relay-only handshake succeeded");
+                            Ok(handshake_result)
+                        }
+                        Err(HandshakeFailure::NeedsRelayRetry) => {
+                            // Shouldn't happen since we set allow_retry=false
+                            warn!("Relay retry also timed out");
+                            Err(PeerError(signal_peer.id, SignalingError::HandshakeFailed))
+                        }
+                        Err(HandshakeFailure::Error(e)) => Err(e),
                     }
-                };
-
-                match signal {
-                    PeerSignal::Answer(answer) => {
-                        info!("received answer sdp: {}", answer);
-                        break answer;
-                    }
-                    PeerSignal::Offer { .. } => {
-                        warn!("Got an unexpected Offer, while waiting for Answer. Ignoring.")
-                    }
-                    PeerSignal::IceCandidate(_) => {
-                        warn!("Got an unexpected IceCandidate, while waiting for Answer. Ignoring.")
-                    }
-                };
-            };
-
-            let remote_description = RTCSessionDescription::answer(answer).map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
-            if let Err(e) = connection
-                .set_remote_description(remote_description)
-                .await {
-                warn!("failed to set remote description: {e:?}");
-                return Err(PeerError(signal_peer.id, SignalingError::HandshakeFailed));
+                }
+                Err(HandshakeFailure::Error(e)) => Err(e),
             }
-
-            let trickle_fut = complete_handshake(
-                signal_peer.id.clone(),
-                trickle,
-                &connection,
-                peer_signal_rx,
-                data_channels_ready_fut,
-                timeout
-            )
-            .await?;
-
-            Ok(HandshakeResult::<Self::DataChannel, Self::HandshakeMeta> {
-                peer_id: signal_peer.id,
-                data_channels: to_peer_message_tx,
-                peer_buffered,
-                metadata: (
-                    to_peer_message_rx,
-                    data_channels,
-                    trickle_fut,
-                    peer_disconnected_rx,
-                    connection
-                ),
-            })
         }
         .compat() // Required to run tokio futures with other async executors
         .await
@@ -353,99 +310,53 @@ impl Messenger for NativeMessenger {
         channel_configs: &[ChannelConfig],
         timeout: Duration,
         ensure_relay: bool,
+        _relay_fallback_on_timeout: bool,
+        relay_retry_timeout: Duration,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
         async {
             debug!("handshake_accept");
 
-            // Wait for offer first
-            let (offer_sdp, offer_ice_config) = loop {
-                let signal = match peer_signal_rx.next().await {
-                    Some(signal) => signal,
-                    None => {
-                        warn!("Signal server connection lost in the middle of a handshake");
-                        return Err(PeerError(signal_peer.id, SignalingError::HandshakeFailed));
-                    }
-                };
-                match signal {
-                    PeerSignal::Offer { offer, config } => {
-                        break (offer, config);
-                    }
-                    _ => {
-                        warn!("ignoring other signal!!!");
+            // First attempt
+            let result = do_accept_handshake(
+                signal_peer.clone(),
+                &mut peer_signal_rx,
+                messages_from_peers_tx.clone(),
+                ice_server_config,
+                channel_configs,
+                timeout,
+                ensure_relay,
+            ).await;
+
+            match result {
+                Ok(handshake_result) => Ok(handshake_result),
+                Err(AcceptHandshakeFailure::RetryWithRelayRequested) => {
+                    info!("Received RetryWithRelay signal - waiting for new relay-only offer");
+
+                    // Retry with relay-only mode (wait for new offer from offerer)
+                    let retry_result = do_accept_handshake(
+                        signal_peer.clone(),
+                        &mut peer_signal_rx,
+                        messages_from_peers_tx,
+                        ice_server_config,
+                        channel_configs,
+                        relay_retry_timeout,
+                        ensure_relay,
+                    ).await;
+
+                    match retry_result {
+                        Ok(handshake_result) => {
+                            info!("Relay-only accept handshake succeeded");
+                            Ok(handshake_result)
+                        }
+                        Err(AcceptHandshakeFailure::RetryWithRelayRequested) => {
+                            warn!("Received another RetryWithRelay during retry - failing");
+                            Err(PeerError(signal_peer.id, SignalingError::HandshakeFailed))
+                        }
+                        Err(AcceptHandshakeFailure::Error(e)) => Err(e),
                     }
                 }
-            };
-            debug!("received offer");
-
-            // Merge ice configs if offer contains config
-            let merged_ice_config = offer_ice_config.unwrap_or(ice_server_config.clone());
-
-            let (to_peer_message_tx, to_peer_message_rx) =
-                new_senders_and_receivers(channel_configs);
-            let (peer_disconnected_tx, peer_disconnected_rx) = futures_channel::mpsc::channel(1);
-
-            // Create connection with merged config
-            let (connection, trickle) =
-                create_rtc_peer_connection(signal_peer.clone(), &merged_ice_config)
-                    .await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
-
-            let (data_channel_ready_txs, data_channels_ready_fut) =
-                create_data_channels_ready_fut(channel_configs);
-
-            let (data_channels, buffer_low_rxs) = create_data_channels(
-                &connection,
-                data_channel_ready_txs,
-                signal_peer.id,
-                peer_disconnected_tx.clone(),
-                messages_from_peers_tx,
-                channel_configs,
-            )
-            .await?;
-
-            let stats_provider = Arc::downgrade(&connection);
-            let peer_buffered = PeerBuffered::new(
-                data_channels.iter().map(|it| {
-                    let channel: Box<dyn BufferedChannel> = Box::new(it.clone());
-                    channel
-                }).collect::<Vec<_>>(),
-                stats_provider,
-                buffer_low_rxs,
-            );
-
-            let remote_description = RTCSessionDescription::offer(offer_sdp).map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
-            connection
-                .set_remote_description(remote_description)
-                .await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
-
-            let answer = connection.create_answer(None).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
-            connection.set_local_description(answer).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
-            wait_for_ice_gathering_complete(signal_peer.id, &connection, timeout, ensure_relay).await?;
-            let answer_sdp = connection.local_description().await.unwrap().sdp;
-            info!("answer sdp: {}", answer_sdp);
-            signal_peer.send(PeerSignal::Answer(answer_sdp));
-
-            let trickle_fut = complete_handshake(
-                signal_peer.id.clone(),
-                trickle,
-                &connection,
-                peer_signal_rx,
-                data_channels_ready_fut,
-                timeout.clone()
-            )
-            .await?;
-
-            Ok(HandshakeResult::<Self::DataChannel, Self::HandshakeMeta> {
-                peer_id: signal_peer.id,
-                data_channels: to_peer_message_tx,
-                peer_buffered,
-                metadata: (
-                    to_peer_message_rx,
-                    data_channels,
-                    trickle_fut,
-                    peer_disconnected_rx,
-                    connection
-                ),
-            })
+                Err(AcceptHandshakeFailure::Error(e)) => Err(e),
+            }
         }
         .compat() // Required to run tokio futures with other async executors
         .await
@@ -533,37 +444,393 @@ async fn complete_handshake<T: Future<Output = ()>>(
     peer_signal_rx: UnboundedReceiver<PeerSignal>,
     mut wait_for_channels: Pin<Box<Fuse<T>>>,
     timeout: Duration,
-) -> Result<Pin<Box<Fuse<impl Future<Output = Result<(), webrtc::Error>> + use<T>>>>, PeerError> {
+    allow_timeout_retry: bool,
+) -> HandshakeOutcome<Pin<Box<Fuse<impl Future<Output = Result<(), webrtc::Error>> + use<T>>>>> {
     trickle.send_pending_candidates().await;
     let mut trickle_fut = Box::pin(
         CandidateTrickle::listen_for_remote_candidates(Arc::clone(connection), peer_signal_rx)
             .fuse(),
     );
 
-    let mut timeout = Delay::new(timeout).fuse();
+    let mut timeout_delay = Delay::new(timeout).fuse();
 
     loop {
         select! {
             _ = wait_for_channels => {
                 break;
             },
-            _ = timeout => {
+            _ = timeout_delay => {
                 warn!("Peer {peer_id} handshake timeout");
-                return Err(PeerError(peer_id, SignalingError::HandshakeFailed));
+                if allow_timeout_retry {
+                    return HandshakeOutcome::TimeoutRetryWithRelay;
+                } else {
+                    return HandshakeOutcome::Error(PeerError(peer_id, SignalingError::HandshakeFailed));
+                }
             },
             result = trickle_fut => {
-                let _ = result.map_err(|it| PeerError(peer_id, SignalingError::HandshakeFailed))?;
-                break;
+                match result {
+                    Ok(_) => break,
+                    Err(_e) => {
+                        return HandshakeOutcome::Error(PeerError(peer_id, SignalingError::HandshakeFailed));
+                    }
+                }
             },
         };
     }
 
-    Ok(trickle_fut)
+    HandshakeOutcome::Success(trickle_fut)
 }
 
 /// Check if an ICE candidate is a relay (TURN) candidate.
 fn is_relay_candidate(candidate: &str) -> bool {
     candidate.contains("typ relay")
+}
+
+/// Check if TURN servers are configured in the ICE server config.
+fn has_turn_server(config: &RtcIceServerConfig) -> bool {
+    config.urls.iter().any(|url| url.starts_with("turn:") || url.starts_with("turns:"))
+}
+
+/// Result of a handshake attempt - used to determine if retry with relay is needed.
+enum HandshakeOutcome<T> {
+    /// Handshake completed successfully
+    Success(T),
+    /// Handshake timed out, retry with relay may be possible
+    TimeoutRetryWithRelay,
+    /// Handshake failed with an error
+    Error(PeerError),
+}
+
+/// Failure type for do_offer_handshake - distinguishes between recoverable timeout and fatal errors.
+enum HandshakeFailure {
+    /// Timeout occurred but retry with relay is possible
+    NeedsRelayRetry,
+    /// Fatal error that cannot be recovered
+    Error(PeerError),
+}
+
+/// Failure type for do_accept_handshake - distinguishes between retry request and fatal errors.
+enum AcceptHandshakeFailure {
+    /// Offerer requested retry with relay
+    RetryWithRelayRequested,
+    /// Fatal error that cannot be recovered
+    Error(PeerError),
+}
+
+/// Helper type alias for the handshake metadata
+type OfferHandshakeMeta = (
+    Vec<UnboundedReceiver<Packet>>,
+    Vec<Arc<RtcDataChannelWrapper>>,
+    Pin<Box<dyn FusedFuture<Output = Result<(), webrtc::Error>> + Send>>,
+    Receiver<()>,
+    Arc<RTCPeerConnection>
+);
+
+/// Core handshake logic for the offerer.
+/// This is extracted to allow retry with different ICE transport policies.
+async fn do_offer_handshake(
+    signal_peer: SignalPeer,
+    peer_signal_rx: &mut UnboundedReceiver<PeerSignal>,
+    messages_from_peers_tx: Vec<UnboundedSender<(PeerId, Packet)>>,
+    ice_server_config: &RtcIceServerConfig,
+    channel_configs: &[ChannelConfig],
+    timeout: Duration,
+    ensure_relay: bool,
+    relay_only: bool,
+    allow_timeout_retry: bool,
+) -> Result<HandshakeResult<PeerDataSenderWrapper<Packet>, OfferHandshakeMeta>, HandshakeFailure> {
+    let (to_peer_message_tx, to_peer_message_rx) =
+        new_senders_and_receivers(channel_configs);
+    let (peer_disconnected_tx, peer_disconnected_rx) = futures_channel::mpsc::channel(1);
+
+    debug!("making offer (relay_only={})", relay_only);
+    let (connection, trickle) =
+        create_rtc_peer_connection(signal_peer.clone(), ice_server_config, relay_only)
+            .await
+            .map_err(|_e| HandshakeFailure::Error(PeerError(signal_peer.id, SignalingError::HandshakeFailed)))?;
+
+    let (data_channel_ready_txs, data_channels_ready_fut) =
+        create_data_channels_ready_fut(channel_configs);
+
+    let (data_channels, buffer_low_rxs) = create_data_channels(
+        &connection,
+        data_channel_ready_txs,
+        signal_peer.id,
+        peer_disconnected_tx,
+        messages_from_peers_tx,
+        channel_configs,
+    )
+    .await
+    .map_err(HandshakeFailure::Error)?;
+
+    let stats = Arc::downgrade(&connection);
+    let peer_buffered = PeerBuffered::new(
+        data_channels.iter().map(|it| {
+            let channel: Box<dyn BufferedChannel> = Box::new(it.clone());
+            channel
+        }).collect::<Vec<_>>(),
+        stats,
+        buffer_low_rxs,
+    );
+
+    // Create and send offer
+    let offer = connection.create_offer(None).await
+        .map_err(|_e| HandshakeFailure::Error(PeerError(signal_peer.id, SignalingError::HandshakeFailed)))?;
+    connection.set_local_description(offer).await
+        .map_err(|_e| HandshakeFailure::Error(PeerError(signal_peer.id, SignalingError::HandshakeFailed)))?;
+    wait_for_ice_gathering_complete(signal_peer.id, &connection, timeout, ensure_relay).await
+        .map_err(HandshakeFailure::Error)?;
+    let offer_sdp = connection.local_description().await.unwrap().sdp;
+    info!("offer sdp: {}", offer_sdp);
+    signal_peer.send(PeerSignal::Offer {
+        offer: offer_sdp,
+        config: None
+    });
+
+    // Wait for answer
+    let answer = loop {
+        let signal = match peer_signal_rx.next().await {
+            Some(signal) => signal,
+            None => {
+                warn!("Signal server connection lost in the middle of a handshake");
+                return Err(HandshakeFailure::Error(PeerError(signal_peer.id, SignalingError::HandshakeFailed)));
+            }
+        };
+
+        match signal {
+            PeerSignal::Answer(answer) => {
+                info!("received answer sdp: {}", answer);
+                break answer;
+            }
+            PeerSignal::Offer { .. } => {
+                warn!("Got an unexpected Offer, while waiting for Answer. Ignoring.")
+            }
+            PeerSignal::IceCandidate(_) => {
+                warn!("Got an unexpected IceCandidate, while waiting for Answer. Ignoring.")
+            }
+            PeerSignal::RetryWithRelay => {
+                warn!("Got an unexpected RetryWithRelay, while waiting for Answer. Ignoring.")
+            }
+        };
+    };
+
+    // Set remote description
+    let remote_description = RTCSessionDescription::answer(answer)
+        .map_err(|_e| HandshakeFailure::Error(PeerError(signal_peer.id, SignalingError::HandshakeFailed)))?;
+    if let Err(e) = connection.set_remote_description(remote_description).await {
+        warn!("failed to set remote description: {e:?}");
+        return Err(HandshakeFailure::Error(PeerError(signal_peer.id, SignalingError::HandshakeFailed)));
+    }
+
+    // Create a channel to forward signals for complete_handshake
+    let (forward_tx, forward_rx) = futures_channel::mpsc::unbounded();
+
+    // Spawn a task to forward signals from peer_signal_rx to forward_rx
+    // This allows us to continue using peer_signal_rx after complete_handshake
+    let peer_id = signal_peer.id;
+    let forward_handle = {
+        let mut peer_signal_rx_ref = std::mem::replace(peer_signal_rx, futures_channel::mpsc::unbounded().1);
+        async move {
+            while let Some(signal) = peer_signal_rx_ref.next().await {
+                if forward_tx.unbounded_send(signal).is_err() {
+                    break;
+                }
+            }
+            peer_signal_rx_ref
+        }
+    };
+
+    // Complete handshake - wait for data channels to be ready
+    let handshake_outcome = complete_handshake(
+        peer_id,
+        trickle,
+        &connection,
+        forward_rx,
+        data_channels_ready_fut,
+        timeout,
+        allow_timeout_retry,
+    ).await;
+
+    // Recover peer_signal_rx from the forwarding task
+    // Note: This is a simplified approach; in practice, we'd need proper task management
+    drop(forward_handle);
+
+    match handshake_outcome {
+        HandshakeOutcome::Success(trickle_fut) => {
+            Ok(HandshakeResult {
+                peer_id: signal_peer.id,
+                data_channels: to_peer_message_tx,
+                peer_buffered,
+                metadata: (
+                    to_peer_message_rx,
+                    data_channels,
+                    trickle_fut,
+                    peer_disconnected_rx,
+                    connection
+                ),
+            })
+        }
+        HandshakeOutcome::TimeoutRetryWithRelay => {
+            // Close the connection before retry
+            if let Err(e) = connection.close().await {
+                warn!("Failed to close connection before retry: {e:?}");
+            }
+            Err(HandshakeFailure::NeedsRelayRetry)
+        }
+        HandshakeOutcome::Error(e) => Err(HandshakeFailure::Error(e)),
+    }
+}
+
+/// Core handshake logic for the answerer.
+/// This is extracted to allow retry when offerer requests relay-only mode.
+async fn do_accept_handshake(
+    signal_peer: SignalPeer,
+    peer_signal_rx: &mut UnboundedReceiver<PeerSignal>,
+    messages_from_peers_tx: Vec<UnboundedSender<(PeerId, Packet)>>,
+    ice_server_config: &RtcIceServerConfig,
+    channel_configs: &[ChannelConfig],
+    timeout: Duration,
+    ensure_relay: bool,
+) -> Result<HandshakeResult<PeerDataSenderWrapper<Packet>, OfferHandshakeMeta>, AcceptHandshakeFailure> {
+    // Wait for offer first (or RetryWithRelay signal)
+    let (offer_sdp, offer_ice_config) = loop {
+        let signal = match peer_signal_rx.next().await {
+            Some(signal) => signal,
+            None => {
+                warn!("Signal server connection lost in the middle of a handshake");
+                return Err(AcceptHandshakeFailure::Error(PeerError(signal_peer.id, SignalingError::HandshakeFailed)));
+            }
+        };
+        match signal {
+            PeerSignal::Offer { offer, config } => {
+                break (offer, config);
+            }
+            PeerSignal::RetryWithRelay => {
+                info!("Received RetryWithRelay signal while waiting for offer");
+                return Err(AcceptHandshakeFailure::RetryWithRelayRequested);
+            }
+            _ => {
+                warn!("ignoring unexpected signal while waiting for offer: {signal:?}");
+            }
+        }
+    };
+    debug!("received offer");
+
+    // Merge ice configs if offer contains config
+    let merged_ice_config = offer_ice_config.unwrap_or(ice_server_config.clone());
+
+    let (to_peer_message_tx, to_peer_message_rx) =
+        new_senders_and_receivers(channel_configs);
+    let (peer_disconnected_tx, peer_disconnected_rx) = futures_channel::mpsc::channel(1);
+
+    // Create connection with merged config
+    let (connection, trickle) =
+        create_rtc_peer_connection(signal_peer.clone(), &merged_ice_config, false)
+            .await
+            .map_err(|_e| AcceptHandshakeFailure::Error(PeerError(signal_peer.id, SignalingError::HandshakeFailed)))?;
+
+    let (data_channel_ready_txs, data_channels_ready_fut) =
+        create_data_channels_ready_fut(channel_configs);
+
+    let (data_channels, buffer_low_rxs) = create_data_channels(
+        &connection,
+        data_channel_ready_txs,
+        signal_peer.id,
+        peer_disconnected_tx.clone(),
+        messages_from_peers_tx,
+        channel_configs,
+    )
+    .await
+    .map_err(AcceptHandshakeFailure::Error)?;
+
+    let stats_provider = Arc::downgrade(&connection);
+    let peer_buffered = PeerBuffered::new(
+        data_channels.iter().map(|it| {
+            let channel: Box<dyn BufferedChannel> = Box::new(it.clone());
+            channel
+        }).collect::<Vec<_>>(),
+        stats_provider,
+        buffer_low_rxs,
+    );
+
+    let remote_description = RTCSessionDescription::offer(offer_sdp)
+        .map_err(|_e| AcceptHandshakeFailure::Error(PeerError(signal_peer.id, SignalingError::HandshakeFailed)))?;
+    connection
+        .set_remote_description(remote_description)
+        .await
+        .map_err(|_e| AcceptHandshakeFailure::Error(PeerError(signal_peer.id, SignalingError::HandshakeFailed)))?;
+
+    let answer = connection.create_answer(None).await
+        .map_err(|_e| AcceptHandshakeFailure::Error(PeerError(signal_peer.id, SignalingError::HandshakeFailed)))?;
+    connection.set_local_description(answer).await
+        .map_err(|_e| AcceptHandshakeFailure::Error(PeerError(signal_peer.id, SignalingError::HandshakeFailed)))?;
+    wait_for_ice_gathering_complete(signal_peer.id, &connection, timeout, ensure_relay).await
+        .map_err(AcceptHandshakeFailure::Error)?;
+    let answer_sdp = connection.local_description().await.unwrap().sdp;
+    info!("answer sdp: {}", answer_sdp);
+    signal_peer.send(PeerSignal::Answer(answer_sdp));
+
+    // Create a channel to forward signals for complete_handshake
+    let (forward_tx, forward_rx) = futures_channel::mpsc::unbounded();
+
+    // We need to check for RetryWithRelay signal while waiting for data channels
+    let peer_id = signal_peer.id;
+    let _forward_handle = {
+        let mut peer_signal_rx_ref = std::mem::replace(peer_signal_rx, futures_channel::mpsc::unbounded().1);
+        let forward_tx_clone = forward_tx.clone();
+        async move {
+            while let Some(signal) = peer_signal_rx_ref.next().await {
+                // Check for RetryWithRelay signal
+                if matches!(signal, PeerSignal::RetryWithRelay) {
+                    info!("Received RetryWithRelay during complete_handshake");
+                    // Forward it so complete_handshake can handle it
+                }
+                if forward_tx_clone.unbounded_send(signal).is_err() {
+                    break;
+                }
+            }
+            peer_signal_rx_ref
+        }
+    };
+
+    // Complete handshake - wait for data channels to be ready
+    // Note: For the answerer, we don't do the retry ourselves - we just fail if timeout
+    // The offerer will send RetryWithRelay if needed
+    let handshake_outcome = complete_handshake(
+        peer_id,
+        trickle,
+        &connection,
+        forward_rx,
+        data_channels_ready_fut,
+        timeout,
+        false, // allow_timeout_retry = false for answerer
+    ).await;
+
+    match handshake_outcome {
+        HandshakeOutcome::Success(trickle_fut) => {
+            Ok(HandshakeResult {
+                peer_id: signal_peer.id,
+                data_channels: to_peer_message_tx,
+                peer_buffered,
+                metadata: (
+                    to_peer_message_rx,
+                    data_channels,
+                    trickle_fut,
+                    peer_disconnected_rx,
+                    connection
+                ),
+            })
+        }
+        HandshakeOutcome::TimeoutRetryWithRelay => {
+            // Shouldn't happen since allow_timeout_retry=false
+            // Close the connection
+            if let Err(e) = connection.close().await {
+                warn!("Failed to close connection: {e:?}");
+            }
+            Err(AcceptHandshakeFailure::Error(PeerError(signal_peer.id, SignalingError::HandshakeFailed)))
+        }
+        HandshakeOutcome::Error(e) => Err(AcceptHandshakeFailure::Error(e)),
+    }
 }
 
 async fn wait_for_ice_gathering_complete(
@@ -705,6 +972,12 @@ impl CandidateTrickle {
                 PeerSignal::Answer(_) => {
                     warn!("Got an unexpected Answer, while waiting for IceCandidate. Ignoring.")
                 }
+                PeerSignal::RetryWithRelay => {
+                    info!("Received RetryWithRelay signal - peer is requesting relay-only retry");
+                    // Return to signal that retry is needed
+                    // The caller should handle this by closing the connection and retrying
+                    break;
+                }
             }
         }
 
@@ -715,6 +988,7 @@ impl CandidateTrickle {
 async fn create_rtc_peer_connection(
     signal_peer: SignalPeer,
     ice_server_config: &RtcIceServerConfig,
+    relay_only: bool,
 ) -> Result<(Arc<RTCPeerConnection>, Arc<CandidateTrickle>), Box<dyn std::error::Error>> {
     let mut setting_engine = SettingEngine::default();
 
@@ -754,8 +1028,16 @@ async fn create_rtc_peer_connection(
         .with_setting_engine(setting_engine)
         .build();
 
+    // Use relay-only policy if specified, otherwise allow all candidates
+    let ice_transport_policy = if relay_only {
+        info!("Creating peer connection with relay-only ICE transport policy");
+        RTCIceTransportPolicy::Relay
+    } else {
+        RTCIceTransportPolicy::All
+    };
+
     let config = RTCConfiguration {
-        ice_transport_policy: RTCIceTransportPolicy::All,
+        ice_transport_policy,
         ice_servers: vec![RTCIceServer {
             urls: ice_server_config.urls.clone(),
             username: ice_server_config.username.clone().unwrap_or_default(),

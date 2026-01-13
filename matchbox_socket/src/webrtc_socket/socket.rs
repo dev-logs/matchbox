@@ -86,6 +86,10 @@ pub(crate) struct SocketConfig {
     pub(crate) webrtc_handshake_timeout: Duration,
     /// Whether to ensure relay (TURN) candidates are gathered before timeout
     pub(crate) ensure_relay_candidates: bool,
+    /// Whether to retry with relay-only mode when data channel connection times out
+    pub(crate) relay_fallback_on_timeout: bool,
+    /// Timeout for relay retry attempt (shorter than main handshake timeout)
+    pub(crate) relay_retry_timeout: Duration,
 }
 
 /// Builder for [`WebRtcSocket`]s.
@@ -115,6 +119,8 @@ impl WebRtcSocketBuilder {
                 keep_alive_interval: Some(Duration::from_secs(10)),
                 webrtc_handshake_timeout: Duration::from_secs(30),
                 ensure_relay_candidates: false,
+                relay_fallback_on_timeout: false,
+                relay_retry_timeout: Duration::from_secs(15),
             },
             signaller_builder: None,
         }
@@ -191,6 +197,37 @@ impl WebRtcSocketBuilder {
     /// relay candidates to be gathered.
     pub fn ensure_relay_candidates(mut self, ensure: bool) -> Self {
         self.config.ensure_relay_candidates = ensure;
+        self
+    }
+
+    /// Enable automatic retry with relay-only mode when data channel connection times out.
+    ///
+    /// When enabled, if the initial peer connection fails to establish data channels
+    /// within the timeout, the system will:
+    /// 1. Close the failed connection
+    /// 2. Signal the peer to retry with relay-only mode
+    /// 3. Create a new connection with `ice_transport_policy: Relay`
+    /// 4. Complete handshake using only TURN relay candidates
+    ///
+    /// **Requirements:**
+    /// - TURN servers must be configured via [`WebRtcSocketBuilder::ice_server`]
+    /// - Both peers should use compatible versions that support `RetryWithRelay` signal
+    ///
+    /// Default: `false`
+    pub fn relay_fallback_on_timeout(mut self, enable: bool) -> Self {
+        self.config.relay_fallback_on_timeout = enable;
+        self
+    }
+
+    /// Set timeout for relay retry attempt.
+    ///
+    /// This timeout applies only to the relay fallback attempt, not the initial
+    /// connection attempt. A shorter timeout is recommended since relay connections
+    /// should establish quickly if TURN servers are properly configured.
+    ///
+    /// Default: 15 seconds
+    pub fn relay_retry_timeout(mut self, timeout: Duration) -> Self {
+        self.config.relay_retry_timeout = timeout;
         self
     }
 
@@ -869,6 +906,8 @@ async fn run_socket(
         config.keep_alive_interval,
         config.webrtc_handshake_timeout,
         config.ensure_relay_candidates,
+        config.relay_fallback_on_timeout,
+        config.relay_retry_timeout,
     );
 
     let mut message_loop_done = Box::pin(message_loop_fut.fuse());
