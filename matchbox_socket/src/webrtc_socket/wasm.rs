@@ -519,8 +519,9 @@ impl Messenger for WasmMessenger {
         // the offer side will be gathering all ice before sent, and answer side will use full trickle
         wait_for_ice_gathering_complete(signal_peer.id.clone(), conn.clone(), timeout.clone()).await?;
 
-        let answer = PeerSignal::Answer(conn.local_description().unwrap().sdp());
-        info!("answer sdp {answer}");
+        let sdp_answer = conn.local_description().unwrap().sdp();
+        info!("answer sdp {sdp_answer}");
+        let answer = PeerSignal::Answer(sdp_answer);
         signal_peer.send(answer);
 
         complete_handshake(
