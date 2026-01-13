@@ -20,10 +20,10 @@ use futures::{
     future::{Fuse, FusedFuture},
     stream::FuturesUnordered,
 };
-use futures_channel::{mpsc::{Receiver, Sender, TrySendError, UnboundedReceiver, UnboundedSender}, oneshot};
+use futures_channel::{mpsc, mpsc::{Receiver, Sender, TrySendError, UnboundedReceiver, UnboundedSender}, oneshot};
 use futures_timer::Delay;
-use futures_util::{lock::Mutex, select};
-use log::{debug, error, info, trace, warn};
+use futures_util::{lock::Mutex, select, SinkExt};
+use log::{debug, error, info, set_max_level, trace, warn};
 use matchbox_protocol::PeerId;
 use std::{pin::Pin, sync::Arc, time::Duration};
 use std::ops::{Deref, DerefMut};
@@ -37,7 +37,11 @@ use webrtc::{api::APIBuilder, data_channel::{RTCDataChannel, data_channel_init::
     RTCPeerConnection, configuration::RTCConfiguration,
     sdp::session_description::RTCSessionDescription,
 }, Error};
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+use webrtc::ice::mdns::MulticastDnsMode;
+use webrtc::ice::network_type::NetworkType;
+use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use crate::webrtc_socket::batch::Batch;
 use crate::webrtc_socket::error::PeerError;
 
@@ -296,6 +300,7 @@ impl Messenger for NativeMessenger {
 
                 match signal {
                     PeerSignal::Answer(answer) => {
+                        info!("received answer sdp: {}", answer);
                         break answer;
                     }
                     PeerSignal::Offer { .. } => {
@@ -562,25 +567,22 @@ async fn wait_for_ice_gathering_complete(
     connection: &Arc<RTCPeerConnection>,
     timeout: Duration,
 ) -> Result<(), PeerError> {
-    let (tx, rx) = oneshot::channel();
-    let tx = Arc::new(Mutex::new(Some(tx)));
+    let (tx, mut rx) = mpsc::channel(1);
 
     let tx_clone = tx.clone();
     connection.on_ice_gathering_state_change(Box::new(move |state: RTCIceGathererState| {
         if state == RTCIceGathererState::Complete {
-            let tx_clone = tx_clone.clone();
+            let mut tx_clone = tx_clone.clone();
             Box::pin(async move {
-                if let Some(sender) = tx_clone.lock().await.take() {
-                    let _ = sender.send(());
-                }
+                let _ = tx_clone.try_send(());
             })
         } else {
             Box::pin(async {})
         }
     }));
 
-    let mut delay = Delay::new(timeout).fuse();
-    let mut rx = rx.fuse();
+    let mut delay = Delay::new(Duration::from_millis((timeout.as_millis() as u64).min(10000))).fuse();
+    let mut rx = rx.next().fuse();
 
     select! {
         _ = delay => {
@@ -651,7 +653,7 @@ impl CandidateTrickle {
         while let Some(signal) = peer_signal_rx.next().await {
             match signal {
                 PeerSignal::IceCandidate(candidate_json) => {
-                    debug!("received ice candidate: {candidate_json:?}");
+                    info!("received ice candidate: {candidate_json:?}");
                     match serde_json::from_str::<RTCIceCandidateInit>(&candidate_json) {
                         Ok(candidate_init) => {
                             debug!("ice candidate received: {}", candidate_init.candidate);
@@ -685,9 +687,46 @@ async fn create_rtc_peer_connection(
     signal_peer: SignalPeer,
     ice_server_config: &RtcIceServerConfig,
 ) -> Result<(Arc<RTCPeerConnection>, Arc<CandidateTrickle>), Box<dyn std::error::Error>> {
-    let api = APIBuilder::new().build();
+    let mut setting_engine = SettingEngine::default();
+
+    // 1. Filter out interfaces that cause binding errors or are virtual
+    setting_engine.set_interface_filter(Box::new(|iface_name: &str| {
+        let is_virtual = iface_name.contains("utun") ||
+            iface_name.contains("docker") ||
+            iface_name.contains("vboxnet");
+
+        // Return true to KEEP the interface, false to IGNORE it
+        !is_virtual
+    }));
+
+    // 2. Filter specific IP types (Stop the fe80 / Error 49 issue)
+    setting_engine.set_ip_filter(Box::new(|ip| {
+        // Filter loopback addresses (not useful for P2P)
+        if ip.is_loopback() {
+            return false;
+        }
+
+        if ip.is_ipv6() {
+            // Filter link-local IPv6 (fe80::/10) - doesn't route across networks
+            // and causes "Error 49: Can't assign requested address" on macOS
+            // Keep: Global unicast (2000::/3), Unique local (fc00::/7)
+            let segments = match ip {
+                std::net::IpAddr::V6(v6) => v6.segments(),
+                _ => return true,
+            };
+            let is_link_local = (segments[0] & 0xffc0) == 0xfe80;
+            return !is_link_local;
+        }
+
+        true // Keep all IPv4
+    }));
+
+    let api = APIBuilder::new()
+        .with_setting_engine(setting_engine)
+        .build();
 
     let config = RTCConfiguration {
+        ice_transport_policy: RTCIceTransportPolicy::All,
         ice_servers: vec![RTCIceServer {
             urls: ice_server_config.urls.clone(),
             username: ice_server_config.username.clone().unwrap_or_default(),

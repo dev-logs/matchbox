@@ -711,12 +711,11 @@ async fn wait_for_ice_gathering_complete(peer_id: PeerId, conn: Arc<RtcConnectio
 
     conn.set_onicegatheringstatechange(Some(onstatechange.as_ref().unchecked_ref()));
 
-    let mut delay = Delay::new(timeout).fuse();
+    let mut delay = Delay::new(Duration::from_millis((timeout.as_millis() as u64).min(10000))).fuse();
 
     select! {
         _ = delay => {
             warn!("timeout waiting for ice gathering to complete");
-            conn.set_onicegatheringstatechange(None);
             return Err(PeerError(peer_id, SignalingError::HandshakeFailed));
         },
         _ = rx.next() => {
