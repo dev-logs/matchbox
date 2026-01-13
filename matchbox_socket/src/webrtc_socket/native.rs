@@ -279,6 +279,7 @@ impl Messenger for NativeMessenger {
             connection.set_local_description(offer).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
             wait_for_ice_gathering_complete(signal_peer.id, &connection, timeout).await?;
             let offer_sdp = connection.local_description().await.unwrap().sdp;
+            info!("offer sdp: {}", offer_sdp);
             signal_peer.send(PeerSignal::Offer {
                 offer: offer_sdp,
                 config: None

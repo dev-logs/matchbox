@@ -356,8 +356,10 @@ impl Messenger for WasmMessenger {
         wait_for_ice_gathering_complete(signal_peer.id.clone(), conn.clone(), timeout.clone()).await?;
 
         log::info!("sending offer to peer {}", conn.local_description().unwrap().sdp());
+        let offer_sdp = conn.local_description().unwrap().sdp();
+        info!("offer sdp: {}", offer_sdp);
         signal_peer.send(PeerSignal::Offer {
-            offer: conn.local_description().unwrap().sdp(),
+            offer: offer_sdp,
             config: None
         });
 
