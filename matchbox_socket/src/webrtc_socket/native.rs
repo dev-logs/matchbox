@@ -417,6 +417,7 @@ impl Messenger for NativeMessenger {
             connection.set_local_description(answer).await.map_err(|e| PeerError(signal_peer.id, SignalingError::HandshakeFailed))?;
             wait_for_ice_gathering_complete(signal_peer.id, &connection, timeout).await?;
             let answer_sdp = connection.local_description().await.unwrap().sdp;
+            info!("answer sdp: {}", answer_sdp);
             signal_peer.send(PeerSignal::Answer(answer_sdp));
 
             let trickle_fut = complete_handshake(

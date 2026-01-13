@@ -520,6 +520,7 @@ impl Messenger for WasmMessenger {
         wait_for_ice_gathering_complete(signal_peer.id.clone(), conn.clone(), timeout.clone()).await?;
 
         let answer = PeerSignal::Answer(conn.local_description().unwrap().sdp());
+        info!("answer sdp {answer}");
         signal_peer.send(answer);
 
         complete_handshake(
