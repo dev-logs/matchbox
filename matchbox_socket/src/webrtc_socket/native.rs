@@ -916,6 +916,7 @@ async fn wait_for_ice_gathering_complete(
     // Track relay candidates if ensure_relay is enabled
     if ensure_relay {
         let has_relay_clone = has_relay.clone();
+        let mut tx = tx.clone();
         connection.on_ice_candidate(Box::new(move |candidate| {
             if let Some(c) = candidate {
                 if let Ok(json) = c.to_json() {
@@ -925,11 +926,15 @@ async fn wait_for_ice_gathering_complete(
                     }
                 }
             }
+            else {
+                let _ = tx.try_send(());
+            }
+
             Box::pin(async {})
         }));
     }
 
-    let mut delay = Delay::new(Duration::from_millis((timeout.as_millis() as u64).min(10000))).fuse();
+    let mut delay = Delay::new(Duration::from_millis((timeout.as_millis() as u64).min(5500))).fuse();
     let mut rx = rx.next().fuse();
 
     select! {
@@ -1091,7 +1096,7 @@ async fn create_rtc_peer_connection(
         info!("Creating peer connection with relay-only ICE transport policy");
         RTCIceTransportPolicy::Relay
     } else {
-        RTCIceTransportPolicy::All
+        RTCIceTransportPolicy::Relay
     };
 
     let config = RTCConfiguration {

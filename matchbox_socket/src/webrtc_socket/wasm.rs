@@ -807,9 +807,10 @@ async fn wait_for_ice_gathering_complete(peer_id: PeerId, conn: Arc<RtcConnectio
     let has_relay = std::rc::Rc::new(std::cell::RefCell::new(false));
 
     let conn_clone = conn.clone();
+    let mut tx1 = tx.clone();
     let onstatechange: Box<dyn FnMut(JsValue)> = Box::new(move |_| {
         if conn_clone.ice_gathering_state() == RtcIceGatheringState::Complete {
-            let _ = tx.try_send(());
+            let _ = tx1.try_send(());
         }
     });
 
@@ -829,6 +830,9 @@ async fn wait_for_ice_gathering_complete(peer_id: PeerId, conn: Arc<RtcConnectio
                         info!("Relay candidate gathered");
                     }
                 }
+                else {
+                    let _ = tx.try_send(());
+                }
             },
         );
         let closure = Closure::wrap(onicecandidate);
@@ -838,7 +842,7 @@ async fn wait_for_ice_gathering_complete(peer_id: PeerId, conn: Arc<RtcConnectio
         None
     };
 
-    let mut delay = Delay::new(Duration::from_millis((timeout.as_millis() as u64).min(10000))).fuse();
+    let mut delay = Delay::new(Duration::from_millis((timeout.as_millis() as u64).min(5500))).fuse();
 
     let result = select! {
         _ = delay => {
