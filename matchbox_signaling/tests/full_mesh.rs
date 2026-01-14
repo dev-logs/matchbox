@@ -94,7 +94,7 @@ mod tests {
 
         let new_peer_event = recv_peer_event(&mut client_a).await;
 
-        assert_eq!(new_peer_event, JsonPeerEvent::NewPeer(b_uuid));
+        assert_eq!(new_peer_event, JsonPeerEvent::NewPeer { id: b_uuid, ice_config: None });
     }
 
     #[tokio::test]
@@ -119,7 +119,7 @@ mod tests {
 
         // Ensure Peer B was received
         let new_peer_event = recv_peer_event(&mut client_a).await;
-        assert_eq!(new_peer_event, JsonPeerEvent::NewPeer(b_uuid));
+        assert_eq!(new_peer_event, JsonPeerEvent::NewPeer { id: b_uuid, ice_config: None });
 
         // Disconnect Peer B
         _ = client_b.close(None).await;
@@ -150,7 +150,7 @@ mod tests {
 
         let new_peer_event = recv_peer_event(&mut client_a).await;
         let peer_uuid = match new_peer_event {
-            JsonPeerEvent::NewPeer(PeerId(peer_uuid)) => peer_uuid.to_string(),
+            JsonPeerEvent::NewPeer { id: PeerId(peer_uuid), .. } => peer_uuid.to_string(),
             _ => panic!("unexpected event"),
         };
 

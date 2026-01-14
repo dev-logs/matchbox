@@ -305,7 +305,6 @@ impl Messenger for WasmMessenger {
         ice_server_config: RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
         timeout: Duration,
-        ensure_relay: bool,
         _relay_fallback_on_timeout: bool,
         _relay_retry_timeout: Duration,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
@@ -356,7 +355,7 @@ impl Messenger for WasmMessenger {
         // After some investigation, the full trickle on web could causing
         // issues of overloading, we should implement the half-trickle instead.
         // todo: implement the half trickle
-        wait_for_ice_gathering_complete(signal_peer.id.clone(), conn.clone(), timeout.clone(), ensure_relay).await?;
+        wait_for_ice_gathering_complete(signal_peer.id.clone(), conn.clone(), timeout.clone()).await?;
 
         log::info!("sending offer to peer {}", conn.local_description().unwrap().sdp());
         let offer_sdp = conn.local_description().unwrap().sdp();
@@ -426,7 +425,6 @@ impl Messenger for WasmMessenger {
         ice_server_config: &RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
         timeout: Duration,
-        ensure_relay: bool,
         _relay_fallback_on_timeout: bool,
         _relay_retry_timeout: Duration,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
@@ -523,7 +521,7 @@ impl Messenger for WasmMessenger {
 
         // todo: implement the full trickle on accept handshake side
         // the offer side will be gathering all ice before sent, and answer side will use full trickle
-        wait_for_ice_gathering_complete(signal_peer.id.clone(), conn.clone(), timeout.clone(), ensure_relay).await?;
+        wait_for_ice_gathering_complete(signal_peer.id.clone(), conn.clone(), timeout.clone()).await?;
 
         let sdp_answer = conn.local_description().unwrap().sdp();
         info!("answer sdp {sdp_answer}");
@@ -797,14 +795,16 @@ async fn log_selected_candidate_pair(conn: &RtcPeerConnection, peer_id: &PeerId)
     }
 }
 
-async fn wait_for_ice_gathering_complete(peer_id: PeerId, conn: Arc<RtcConnectionWrapper>, timeout: Duration, ensure_relay: bool) -> Result<bool, PeerError> {
+async fn wait_for_ice_gathering_complete(_peer_id: PeerId, conn: Arc<RtcConnectionWrapper>, timeout: Duration) -> Result<bool, PeerError> {
+    use super::ice_tracker::IceCandidateTracker;
+
     if conn.ice_gathering_state() == RtcIceGatheringState::Complete {
         debug!("Ice gathering already completed");
         return Ok(true);
     }
 
     let (mut tx, mut rx) = futures_channel::mpsc::channel(1);
-    let has_relay = std::rc::Rc::new(std::cell::RefCell::new(false));
+    let tracker = std::rc::Rc::new(std::cell::RefCell::new(IceCandidateTracker::new()));
 
     let conn_clone = conn.clone();
     let mut tx1 = tx.clone();
@@ -815,56 +815,52 @@ async fn wait_for_ice_gathering_complete(peer_id: PeerId, conn: Arc<RtcConnectio
     });
 
     let onstatechange = Closure::wrap(onstatechange);
-
     conn.set_onicegatheringstatechange(Some(onstatechange.as_ref().unchecked_ref()));
 
-    // Track relay candidates if ensure_relay is enabled
-    let _onicecandidate_closure = if ensure_relay {
-        let has_relay_clone = has_relay.clone();
-        let onicecandidate: Box<dyn FnMut(RtcPeerConnectionIceEvent)> = Box::new(
-            move |event: RtcPeerConnectionIceEvent| {
-                if let Some(candidate) = event.candidate() {
-                    let candidate_str = candidate.candidate();
-                    if is_relay_candidate(&candidate_str) {
-                        *has_relay_clone.borrow_mut() = true;
-                        info!("Relay candidate gathered");
-                    }
-                }
-                else {
-                    let _ = tx.try_send(());
-                }
-            },
-        );
-        let closure = Closure::wrap(onicecandidate);
-        conn.set_onicecandidate(Some(closure.as_ref().unchecked_ref()));
-        Some(closure)
-    } else {
-        None
-    };
-
-    let mut delay = Delay::new(Duration::from_millis((timeout.as_millis() as u64).min(5500))).fuse();
-
-    let result = select! {
-        _ = delay => {
-            if *has_relay.borrow() {
-                info!("ICE gathering timeout, but relay candidates available - proceeding");
-                Ok(false)  // Timeout but have relay
-            } else if !ensure_relay {
-                warn!("ICE gathering timeout - proceeding with available candidates");
-                Ok(false)  // Timeout, relay not required
+    let tracker_clone = tracker.clone();
+    let onicecandidate: Box<dyn FnMut(RtcPeerConnectionIceEvent)> = Box::new(
+        move |event: RtcPeerConnectionIceEvent| {
+            if let Some(candidate) = event.candidate() {
+                let candidate_str = candidate.candidate();
+                tracker_clone.borrow_mut().add_candidate(&candidate_str);
             } else {
-                warn!("ICE gathering timeout without relay candidates");
-                Err(PeerError(peer_id, SignalingError::HandshakeFailed))
+                let _ = tx.try_send(());
             }
         },
-        _ = rx.next() => {
-            info!("Ice gathering completed");
-            Ok(true)  // Complete
+    );
+    let onicecandidate_closure = Closure::wrap(onicecandidate);
+    conn.set_onicecandidate(Some(onicecandidate_closure.as_ref().unchecked_ref()));
+
+    let ice_timeout = Duration::from_millis((timeout.as_millis() as u64).min(5500));
+    let early_check_delay = Duration::from_secs(2);
+
+    let mut timeout_delay = Delay::new(ice_timeout).fuse();
+    let mut early_check = Delay::new(early_check_delay).fuse();
+    let mut rx = rx.next().fuse();
+
+    let result = loop {
+        select! {
+            _ = timeout_delay => {
+                let summary = tracker.borrow().summary();
+                warn!("ICE gathering timeout - proceeding with available candidates ({})", summary);
+                break Ok(false);
+            },
+            _ = early_check => {
+                let sufficient = tracker.borrow().has_sufficient_candidates();
+                if sufficient {
+                    let summary = tracker.borrow().summary();
+                    info!("ICE gathering early termination - sufficient candidates gathered ({})", summary);
+                    break Ok(true);
+                }
+            },
+            _ = rx => {
+                info!("Ice gathering completed");
+                break Ok(true);
+            }
         }
     };
 
     conn.set_onicegatheringstatechange(None);
-    // Note: We don't clear onicecandidate here as it might be set later by complete_handshake
 
     result
 }

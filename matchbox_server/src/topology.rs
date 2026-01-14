@@ -239,7 +239,7 @@ mod tests {
 
         let new_peer_event = recv_peer_event(&mut client_a).await;
 
-        assert_eq!(new_peer_event, JsonPeerEvent::NewPeer(b_uuid));
+        assert_eq!(new_peer_event, JsonPeerEvent::NewPeer { id: b_uuid, ice_config: None });
     }
 
     #[tokio::test]
@@ -264,7 +264,7 @@ mod tests {
 
         // Ensure Peer B was received
         let new_peer_event = recv_peer_event(&mut client_a).await;
-        assert_eq!(new_peer_event, JsonPeerEvent::NewPeer(b_uuid));
+        assert_eq!(new_peer_event, JsonPeerEvent::NewPeer { id: b_uuid, ice_config: None });
 
         // Disconnect Peer B
         _ = client_b.close(None).await;
@@ -353,8 +353,8 @@ mod tests {
         let new_peer_b = recv_peer_event(&mut client_a).await;
         let new_peer_d = recv_peer_event(&mut client_c).await;
 
-        assert_eq!(new_peer_b, JsonPeerEvent::NewPeer(b_uuid));
-        assert_eq!(new_peer_d, JsonPeerEvent::NewPeer(d_uuid));
+        assert_eq!(new_peer_b, JsonPeerEvent::NewPeer { id: b_uuid, ice_config: None });
+        assert_eq!(new_peer_d, JsonPeerEvent::NewPeer { id: d_uuid, ice_config: None });
 
         let timeout = time::sleep(Duration::from_millis(100));
         pin_mut!(timeout);
@@ -396,7 +396,7 @@ mod tests {
         // Clients should be matched in pairs as they arrive, i.e. a + b and c + d
         let new_peer_c = recv_peer_event(&mut client_a).await;
 
-        assert_eq!(new_peer_c, JsonPeerEvent::NewPeer(c_uuid));
+        assert_eq!(new_peer_c, JsonPeerEvent::NewPeer { id: c_uuid, ice_config: None });
 
         let timeout = time::sleep(Duration::from_millis(100));
         pin_mut!(timeout);
@@ -446,8 +446,8 @@ mod tests {
         let new_peer_c = recv_peer_event(&mut client_a).await;
         let new_peer_d = recv_peer_event(&mut client_b).await;
 
-        assert_eq!(new_peer_c, JsonPeerEvent::NewPeer(c_uuid));
-        assert_eq!(new_peer_d, JsonPeerEvent::NewPeer(d_uuid));
+        assert_eq!(new_peer_c, JsonPeerEvent::NewPeer { id: c_uuid, ice_config: None });
+        assert_eq!(new_peer_d, JsonPeerEvent::NewPeer { id: d_uuid, ice_config: None });
 
         let timeout = time::sleep(Duration::from_millis(100));
         pin_mut!(timeout);
@@ -504,13 +504,13 @@ mod tests {
         let new_peer_c = recv_peer_event(&mut client_a).await;
         let new_peer_d = recv_peer_event(&mut client_b).await;
         let new_peer_e = recv_peer_event(&mut client_b).await;
-        assert_eq!(new_peer_e, JsonPeerEvent::NewPeer(e_uuid));
+        assert_eq!(new_peer_e, JsonPeerEvent::NewPeer { id: e_uuid, ice_config: None });
         let new_peer_e = recv_peer_event(&mut client_d).await;
 
-        assert_eq!(new_peer_c, JsonPeerEvent::NewPeer(c_uuid));
-        assert_eq!(new_peer_d, JsonPeerEvent::NewPeer(d_uuid));
-        assert_eq!(new_peer_d, JsonPeerEvent::NewPeer(d_uuid));
-        assert_eq!(new_peer_e, JsonPeerEvent::NewPeer(e_uuid));
+        assert_eq!(new_peer_c, JsonPeerEvent::NewPeer { id: c_uuid, ice_config: None });
+        assert_eq!(new_peer_d, JsonPeerEvent::NewPeer { id: d_uuid, ice_config: None });
+        assert_eq!(new_peer_d, JsonPeerEvent::NewPeer { id: d_uuid, ice_config: None });
+        assert_eq!(new_peer_e, JsonPeerEvent::NewPeer { id: e_uuid, ice_config: None });
 
         let timeout = time::sleep(Duration::from_millis(100));
         pin_mut!(timeout);

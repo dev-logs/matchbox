@@ -39,6 +39,7 @@ use webrtc::{api::APIBuilder, data_channel::{RTCDataChannel, data_channel_init::
 }, Error};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+use webrtc::ice::network_type::NetworkType;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use crate::webrtc_socket::batch::Batch;
 use crate::webrtc_socket::error::PeerError;
@@ -241,7 +242,6 @@ impl Messenger for NativeMessenger {
         ice_server_config: RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
         timeout: Duration,
-        ensure_relay: bool,
         relay_fallback_on_timeout: bool,
         relay_retry_timeout: Duration,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
@@ -257,7 +257,6 @@ impl Messenger for NativeMessenger {
                 &ice_server_config,
                 channel_configs,
                 timeout,
-                ensure_relay,
                 false, // relay_only = false for first attempt
                 can_retry_with_relay, // allow retry if configured
             ).await;
@@ -278,7 +277,6 @@ impl Messenger for NativeMessenger {
                         &ice_server_config,
                         channel_configs,
                         relay_retry_timeout,
-                        ensure_relay,
                         true, // relay_only = true for retry
                         false, // no further retries
                     ).await;
@@ -310,7 +308,6 @@ impl Messenger for NativeMessenger {
         ice_server_config: &RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
         timeout: Duration,
-        ensure_relay: bool,
         _relay_fallback_on_timeout: bool,
         relay_retry_timeout: Duration,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
@@ -325,7 +322,6 @@ impl Messenger for NativeMessenger {
                 ice_server_config,
                 channel_configs,
                 timeout,
-                ensure_relay,
             ).await;
 
             match result {
@@ -341,7 +337,6 @@ impl Messenger for NativeMessenger {
                         ice_server_config,
                         channel_configs,
                         relay_retry_timeout,
-                        ensure_relay,
                     ).await;
 
                     match retry_result {
@@ -594,7 +589,6 @@ async fn do_offer_handshake(
     ice_server_config: &RtcIceServerConfig,
     channel_configs: &[ChannelConfig],
     timeout: Duration,
-    ensure_relay: bool,
     relay_only: bool,
     allow_timeout_retry: bool,
 ) -> Result<HandshakeResult<PeerDataSenderWrapper<Packet>, OfferHandshakeMeta>, HandshakeFailure> {
@@ -637,7 +631,7 @@ async fn do_offer_handshake(
         .map_err(|_e| HandshakeFailure::Error(PeerError(signal_peer.id, SignalingError::HandshakeFailed)))?;
     connection.set_local_description(offer).await
         .map_err(|_e| HandshakeFailure::Error(PeerError(signal_peer.id, SignalingError::HandshakeFailed)))?;
-    wait_for_ice_gathering_complete(signal_peer.id, &connection, timeout, ensure_relay).await
+    wait_for_ice_gathering_complete(signal_peer.id, &connection, timeout).await
         .map_err(HandshakeFailure::Error)?;
     let offer_sdp = connection.local_description().await.unwrap().sdp;
     info!("offer sdp: {}", offer_sdp);
@@ -749,7 +743,6 @@ async fn do_accept_handshake(
     ice_server_config: &RtcIceServerConfig,
     channel_configs: &[ChannelConfig],
     timeout: Duration,
-    ensure_relay: bool,
 ) -> Result<HandshakeResult<PeerDataSenderWrapper<Packet>, OfferHandshakeMeta>, AcceptHandshakeFailure> {
     // Wait for offer first (or RetryWithRelay signal)
     let (offer_sdp, offer_ice_config) = loop {
@@ -823,7 +816,7 @@ async fn do_accept_handshake(
         .map_err(|_e| AcceptHandshakeFailure::Error(PeerError(signal_peer.id, SignalingError::HandshakeFailed)))?;
     connection.set_local_description(answer).await
         .map_err(|_e| AcceptHandshakeFailure::Error(PeerError(signal_peer.id, SignalingError::HandshakeFailed)))?;
-    wait_for_ice_gathering_complete(signal_peer.id, &connection, timeout, ensure_relay).await
+    wait_for_ice_gathering_complete(signal_peer.id, &connection, timeout).await
         .map_err(AcceptHandshakeFailure::Error)?;
     let answer_sdp = connection.local_description().await.unwrap().sdp;
     info!("answer sdp: {}", answer_sdp);
@@ -893,13 +886,14 @@ async fn do_accept_handshake(
 }
 
 async fn wait_for_ice_gathering_complete(
-    peer_id: PeerId,
+    _peer_id: PeerId,
     connection: &Arc<RTCPeerConnection>,
     timeout: Duration,
-    ensure_relay: bool,
 ) -> Result<bool, PeerError> {
+    use super::ice_tracker::IceCandidateTracker;
+
     let (tx, mut rx) = mpsc::channel(1);
-    let has_relay = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tracker = Arc::new(IceCandidateTracker::new());
 
     let tx_clone = tx.clone();
     connection.on_ice_gathering_state_change(Box::new(move |state: RTCIceGathererState| {
@@ -913,46 +907,42 @@ async fn wait_for_ice_gathering_complete(
         }
     }));
 
-    // Track relay candidates if ensure_relay is enabled
-    if ensure_relay {
-        let has_relay_clone = has_relay.clone();
-        let mut tx = tx.clone();
-        connection.on_ice_candidate(Box::new(move |candidate| {
-            if let Some(c) = candidate {
-                if let Ok(json) = c.to_json() {
-                    if is_relay_candidate(&json.candidate) {
-                        has_relay_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-                        info!("Relay candidate gathered");
-                    }
-                }
+    let tracker_clone = tracker.clone();
+    let mut tx_early = tx.clone();
+    connection.on_ice_candidate(Box::new(move |candidate| {
+        if let Some(c) = candidate {
+            if let Ok(json) = c.to_json() {
+                tracker_clone.add_candidate(&json.candidate);
             }
-            else {
-                let _ = tx.try_send(());
-            }
+        } else {
+            let _ = tx_early.try_send(());
+        }
+        Box::pin(async {})
+    }));
 
-            Box::pin(async {})
-        }));
-    }
+    let ice_timeout = Duration::from_millis((timeout.as_millis() as u64).min(5500));
+    let early_check_delay = Duration::from_secs(2);
 
-    let mut delay = Delay::new(Duration::from_millis((timeout.as_millis() as u64).min(5500))).fuse();
+    let mut timeout_delay = Delay::new(ice_timeout).fuse();
+    let mut early_check = Delay::new(early_check_delay).fuse();
     let mut rx = rx.next().fuse();
 
-    select! {
-        _ = delay => {
-            if has_relay.load(std::sync::atomic::Ordering::SeqCst) {
-                info!("ICE gathering timeout, but relay candidates available - proceeding");
-                return Ok(false);  // Timeout but have relay
-            } else if !ensure_relay {
-                warn!("ICE gathering timeout - proceeding with available candidates");
-                return Ok(false);  // Timeout, relay not required
-            } else {
-                warn!("ICE gathering timeout without relay candidates");
-                return Err(PeerError(peer_id, SignalingError::HandshakeFailed));
+    loop {
+        select! {
+            _ = timeout_delay => {
+                warn!("ICE gathering timeout - proceeding with available candidates ({})", tracker.summary());
+                return Ok(false);
+            },
+            _ = early_check => {
+                if tracker.has_sufficient_candidates() {
+                    info!("ICE gathering early termination - sufficient candidates gathered ({})", tracker.summary());
+                    return Ok(true);
+                }
+            },
+            _ = rx => {
+                info!("Ice gathering completed");
+                return Ok(true);
             }
-        },
-        _ = rx => {
-            info!("Ice gathering completed");
-            return Ok(true);  // Complete
         }
     }
 }
@@ -1087,6 +1077,7 @@ async fn create_rtc_peer_connection(
         true // Keep all IPv4
     }));
 
+    // setting_engine.set_network_types(vec![NetworkType::Udp4, NetworkType::Tcp4]);
     let api = APIBuilder::new()
         .with_setting_engine(setting_engine)
         .build();
@@ -1137,10 +1128,16 @@ async fn create_rtc_peer_connection(
         let peer_id = peer_id_for_state;
         Box::pin(async move {
             info!("[ICE] peer={} state={:?}", peer_id, state);
-            if matches!(state, RTCIceConnectionState::Connected | RTCIceConnectionState::Completed) {
-                if let Some(conn) = connection_clone.upgrade() {
-                    log_selected_candidate_pair(&conn, &peer_id).await;
+            match state {
+                RTCIceConnectionState::Connected | RTCIceConnectionState::Completed => {
+                    if let Some(conn) = connection_clone.upgrade() {
+                        log_selected_candidate_pair(&conn, &peer_id).await;
+                    }
                 }
+                RTCIceConnectionState::Failed => {
+                    warn!("[ICE] peer={} ICE connection failed (possible TURN permission error)", peer_id);
+                }
+                _ => {}
             }
         })
     }));
