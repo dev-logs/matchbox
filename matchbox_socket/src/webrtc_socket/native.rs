@@ -30,6 +30,7 @@ use std::ops::{Deref, DerefMut};
 use futures::executor::block_on;
 use webrtc::{api::APIBuilder, data_channel::{RTCDataChannel, data_channel_init::RTCDataChannelInit}, ice_transport::{
     ice_candidate::{RTCIceCandidate, RTCIceCandidateInit},
+    ice_connection_state::RTCIceConnectionState,
     ice_gatherer_state::RTCIceGathererState,
     ice_server::RTCIceServer,
 }, peer_connection::{
@@ -448,7 +449,7 @@ async fn complete_handshake<T: Future<Output = ()>>(
 ) -> HandshakeOutcome<Pin<Box<Fuse<impl Future<Output = Result<(), webrtc::Error>> + use<T>>>>> {
     trickle.send_pending_candidates().await;
     let mut trickle_fut = Box::pin(
-        CandidateTrickle::listen_for_remote_candidates(Arc::clone(connection), peer_signal_rx)
+        CandidateTrickle::listen_for_remote_candidates(Arc::clone(connection), peer_signal_rx, peer_id)
             .fuse(),
     );
 
@@ -484,6 +485,64 @@ async fn complete_handshake<T: Future<Output = ()>>(
 /// Check if an ICE candidate is a relay (TURN) candidate.
 fn is_relay_candidate(candidate: &str) -> bool {
     candidate.contains("typ relay")
+}
+
+fn parse_candidate_type(candidate: &str) -> &'static str {
+    if candidate.contains("typ host") {
+        "host"
+    } else if candidate.contains("typ srflx") {
+        "srflx"
+    } else if candidate.contains("typ prflx") {
+        "prflx"
+    } else if candidate.contains("typ relay") {
+        "relay"
+    } else {
+        "unknown"
+    }
+}
+
+async fn log_selected_candidate_pair(connection: &RTCPeerConnection, peer_id: &PeerId) {
+    let stats = connection.get_stats().await;
+
+    let mut local_candidates: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut remote_candidates: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    for (id, report) in stats.reports.iter() {
+        match report {
+            StatsReportType::LocalCandidate(c) => {
+                let info = format!("type={:?}, addr={}:{}",
+                    c.candidate_type, c.ip, c.port);
+                local_candidates.insert(id.clone(), info);
+            }
+            StatsReportType::RemoteCandidate(c) => {
+                let info = format!("type={:?}, addr={}:{}",
+                    c.candidate_type, c.ip, c.port);
+                remote_candidates.insert(id.clone(), info);
+            }
+            _ => {}
+        }
+    }
+
+    for (_id, report) in stats.reports.iter() {
+        if let StatsReportType::CandidatePair(pair) = report {
+            if pair.nominated {
+                let local_info = local_candidates.get(&pair.local_candidate_id)
+                    .map(|s| s.as_str())
+                    .unwrap_or("unknown");
+                let remote_info = remote_candidates.get(&pair.remote_candidate_id)
+                    .map(|s| s.as_str())
+                    .unwrap_or("unknown");
+                info!(
+                    "[ICE] peer={} selected_pair: local=[{}], remote=[{}], state={:?}, rtt={:.2}ms",
+                    peer_id,
+                    local_info,
+                    remote_info,
+                    pair.state,
+                    pair.current_round_trip_time * 1000.0
+                );
+            }
+        }
+    }
 }
 
 /// Check if TURN servers are configured in the ICE server config.
@@ -919,17 +978,17 @@ impl CandidateTrickle {
             }
         };
 
+        let candidate_type = parse_candidate_type(&candidate_init.candidate);
+        info!("[ICE] peer={} local_candidate: type={}, candidate={}", self.signal_peer.id, candidate_type, candidate_init.candidate);
+
         let candidate_json =
             serde_json::to_string(&candidate_init).expect("failed to serialize candidate to json");
 
-        // Local candidates can only be sent after the remote description
         if peer_connection.remote_description().await.is_some() {
-            // Can send local candidate already
             debug!("sending IceCandidate signal: {candidate:?}");
             self.signal_peer
                 .send(PeerSignal::IceCandidate(candidate_json));
         } else {
-            // Can't send yet, store in pending
             debug!("storing pending IceCandidate signal: {candidate_json:?}");
             self.pending.lock().await.push(candidate_json);
         }
@@ -945,14 +1004,15 @@ impl CandidateTrickle {
     async fn listen_for_remote_candidates(
         peer_connection: Arc<RTCPeerConnection>,
         mut peer_signal_rx: UnboundedReceiver<PeerSignal>,
+        peer_id: PeerId,
     ) -> Result<(), webrtc::Error> {
         while let Some(signal) = peer_signal_rx.next().await {
             match signal {
                 PeerSignal::IceCandidate(candidate_json) => {
-                    info!("received ice candidate: {candidate_json:?}");
                     match serde_json::from_str::<RTCIceCandidateInit>(&candidate_json) {
                         Ok(candidate_init) => {
-                            debug!("ice candidate received: {}", candidate_init.candidate);
+                            let candidate_type = parse_candidate_type(&candidate_init.candidate);
+                            info!("[ICE] peer={} remote_candidate: type={}, candidate={}", peer_id, candidate_type, candidate_init.candidate);
                             peer_connection.add_ice_candidate(candidate_init).await?;
                         }
                         Err(err) => {
@@ -974,8 +1034,6 @@ impl CandidateTrickle {
                 }
                 PeerSignal::RetryWithRelay => {
                     info!("Received RetryWithRelay signal - peer is requesting relay-only retry");
-                    // Return to signal that retry is needed
-                    // The caller should handle this by closing the connection and retrying
                     break;
                 }
             }
@@ -1049,6 +1107,7 @@ async fn create_rtc_peer_connection(
     let connection = api.new_peer_connection(config).await?;
     let connection = Arc::new(connection);
 
+    let peer_id_for_state = signal_peer.id;
     let trickle = Arc::new(CandidateTrickle::new(signal_peer));
 
     let connection2 = Arc::downgrade(&connection);
@@ -1062,6 +1121,20 @@ async fn create_rtc_peer_connection(
                     trickle2.on_local_candidate(&connection2, c).await;
                 } else {
                     warn!("missing peer_connection?");
+                }
+            }
+        })
+    }));
+
+    let connection_for_state = Arc::downgrade(&connection);
+    connection.on_ice_connection_state_change(Box::new(move |state: RTCIceConnectionState| {
+        let connection_clone = connection_for_state.clone();
+        let peer_id = peer_id_for_state;
+        Box::pin(async move {
+            info!("[ICE] peer={} state={:?}", peer_id, state);
+            if matches!(state, RTCIceConnectionState::Connected | RTCIceConnectionState::Completed) {
+                if let Some(conn) = connection_clone.upgrade() {
+                    log_selected_candidate_pair(&conn, &peer_id).await;
                 }
             }
         })

@@ -18,7 +18,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use wasm_bindgen::{JsCast, JsValue, convert::FromWasmAbi, prelude::*};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Event, MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelInit, RtcDataChannelType, RtcIceCandidateInit, RtcIceGatheringState, RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit, RtcStatsReport, RtcStatsReportInternal};
+use web_sys::{Event, MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelInit, RtcDataChannelType, RtcIceCandidateInit, RtcIceConnectionState, RtcIceGatheringState, RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit, RtcStatsReport, RtcStatsReportInternal};
 use ws_stream_wasm::{WsMessage, WsMeta, WsStream};
 use crate::webrtc_socket::batch::Batch;
 use crate::webrtc_socket::error::PeerError;
@@ -566,13 +566,19 @@ async fn complete_handshake(
     timeout: Duration,
 ) -> Result<(), PeerError> {
     let peer_id = signal_peer.id.clone();
+    let peer_id_for_ice = signal_peer.id;
     let onicecandidate: Box<dyn FnMut(RtcPeerConnectionIceEvent)> = Box::new(
         move |event: RtcPeerConnectionIceEvent| {
             let candidate_json = match event.candidate() {
-                Some(candidate) => js_sys::JSON::stringify(&candidate.to_json())
-                    .expect("failed to serialize candidate")
-                    .as_string()
-                    .unwrap(),
+                Some(candidate) => {
+                    let candidate_str = candidate.candidate();
+                    let candidate_type = parse_candidate_type(&candidate_str);
+                    info!("[ICE] peer={} local_candidate: type={}, candidate={}", peer_id_for_ice, candidate_type, candidate_str);
+                    js_sys::JSON::stringify(&candidate.to_json())
+                        .expect("failed to serialize candidate")
+                        .as_string()
+                        .unwrap()
+                },
                 None => {
                     debug!(
                         "Received RtcPeerConnectionIceEvent with no candidate. This means there are no further ice candidates for this session"
@@ -593,7 +599,7 @@ async fn complete_handshake(
     // handle pending ICE candidates
     for candidate in received_candidates {
         debug!("adding ice candidate {candidate:?}");
-        try_add_rtc_ice_candidate(&conn, &candidate).await;
+        try_add_rtc_ice_candidate(&conn, &candidate, &peer_id).await;
     }
 
     // select for data channels ready or ice candidates
@@ -608,12 +614,12 @@ async fn complete_handshake(
             }
             msg = peer_signal_rx.next() => {
                 if let Some(PeerSignal::IceCandidate(candidate)) = msg {
-                    try_add_rtc_ice_candidate(&conn, &candidate).await;
+                    try_add_rtc_ice_candidate(&conn, &candidate, &peer_id).await;
                 }
             }
             _ = delay => {
                 warn!("timeout waiting for data channels to open");
-                err.replace(Err(PeerError(peer_id, SignalingError::HandshakeFailed)));
+                err.replace(Err(PeerError(peer_id.clone(), SignalingError::HandshakeFailed)));
             }
         };
     }
@@ -638,7 +644,7 @@ async fn complete_handshake(
     err.unwrap_or(Ok(()))
 }
 
-async fn try_add_rtc_ice_candidate(connection: &RtcPeerConnection, candidate_string: &str) {
+async fn try_add_rtc_ice_candidate(connection: &RtcPeerConnection, candidate_string: &str, peer_id: &PeerId) {
     let parsed_candidate = match js_sys::JSON::parse(candidate_string) {
         Ok(c) => c,
         Err(err) => {
@@ -652,7 +658,9 @@ async fn try_add_rtc_ice_candidate(connection: &RtcPeerConnection, candidate_str
         None
     } else {
         let candidate = RtcIceCandidateInit::from(parsed_candidate);
-        debug!("ice candidate received: {candidate:?}");
+        let candidate_str = candidate.get_candidate();
+        let candidate_type = parse_candidate_type(&candidate_str);
+        info!("[ICE] peer={} remote_candidate: type={}, candidate={}", peer_id, candidate_type, candidate_str);
         Some(candidate)
     };
 
@@ -682,15 +690,19 @@ fn create_rtc_peer_connection(peer_id: &PeerId, ice_server_config: &RtcIceServer
     let connection = RtcConnectionWrapper::new(RtcPeerConnection::new_with_configuration(&peer_config).map_err(|it| PeerError(peer_id.clone(), SignalingError::UserImplementationError(format!("{it:?}"))))?);
 
     let connection_1 = connection.clone();
+    let peer_id_for_state = peer_id.clone();
     let oniceconnectionstatechange: Box<dyn FnMut(_)> = Box::new(move |_event: JsValue| {
-        debug!(
-            "ice connection state changed: {:?}",
-            connection_1.ice_connection_state()
-        );
+        let state = connection_1.ice_connection_state();
+        info!("[ICE] peer={} state={:?}", peer_id_for_state, state);
+        if matches!(state, RtcIceConnectionState::Connected | RtcIceConnectionState::Completed) {
+            let conn_for_stats = connection_1.0.clone();
+            let peer_id_for_stats = peer_id_for_state;
+            wasm_bindgen_futures::spawn_local(async move {
+                log_selected_candidate_pair(&conn_for_stats, &peer_id_for_stats).await;
+            });
+        }
     });
     let oniceconnectionstatechange = Closure::wrap(oniceconnectionstatechange);
-    // NOTE: Not attaching a handler on this event causes FF to disconnect after a couple of seconds
-    // see: https://github.com/johanhelsing/matchbox/issues/36
     connection
         .set_oniceconnectionstatechange(Some(oniceconnectionstatechange.as_ref().unchecked_ref()));
     oniceconnectionstatechange.forget();
@@ -701,6 +713,88 @@ fn create_rtc_peer_connection(peer_id: &PeerId, ice_server_config: &RtcIceServer
 /// Check if an ICE candidate is a relay (TURN) candidate.
 fn is_relay_candidate(candidate: &str) -> bool {
     candidate.contains("typ relay")
+}
+
+fn parse_candidate_type(candidate: &str) -> &'static str {
+    if candidate.contains("typ host") {
+        "host"
+    } else if candidate.contains("typ srflx") {
+        "srflx"
+    } else if candidate.contains("typ prflx") {
+        "prflx"
+    } else if candidate.contains("typ relay") {
+        "relay"
+    } else {
+        "unknown"
+    }
+}
+
+async fn log_selected_candidate_pair(conn: &RtcPeerConnection, peer_id: &PeerId) {
+    let Ok(stats_js) = JsFuture::from(conn.get_stats()).await else {
+        return;
+    };
+    let stats: RtcStatsReport = stats_js.into();
+
+    let mut local_candidates: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut remote_candidates: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    for val in stats.values() {
+        let Ok(report) = val else { continue };
+        let Ok(report_type) = Reflect::get(&report, &JsValue::from_str("type")) else { continue };
+        let Some(type_str) = report_type.as_string() else { continue };
+        let Ok(id) = Reflect::get(&report, &JsValue::from_str("id")) else { continue };
+        let Some(id_str) = id.as_string() else { continue };
+
+        if type_str == "local-candidate" || type_str == "remote-candidate" {
+            let candidate_type = Reflect::get(&report, &JsValue::from_str("candidateType"))
+                .ok().and_then(|v| v.as_string()).unwrap_or_default();
+            let address = Reflect::get(&report, &JsValue::from_str("address"))
+                .ok().and_then(|v| v.as_string()).unwrap_or_default();
+            let port = Reflect::get(&report, &JsValue::from_str("port"))
+                .ok().and_then(|v| v.as_f64()).unwrap_or(0.0) as u16;
+            let protocol = Reflect::get(&report, &JsValue::from_str("protocol"))
+                .ok().and_then(|v| v.as_string()).unwrap_or_default();
+
+            let info = format!("type={}, addr={}:{}, protocol={}", candidate_type, address, port, protocol);
+            if type_str == "local-candidate" {
+                local_candidates.insert(id_str, info);
+            } else {
+                remote_candidates.insert(id_str, info);
+            }
+        }
+    }
+
+    for val in stats.values() {
+        let Ok(report) = val else { continue };
+        let Ok(report_type) = Reflect::get(&report, &JsValue::from_str("type")) else { continue };
+        let Some(type_str) = report_type.as_string() else { continue };
+
+        if type_str != "candidate-pair" {
+            continue;
+        }
+
+        let Ok(state) = Reflect::get(&report, &JsValue::from_str("state")) else { continue };
+        let Some(state_str) = state.as_string() else { continue };
+
+        if state_str != "succeeded" {
+            continue;
+        }
+
+        let local_id = Reflect::get(&report, &JsValue::from_str("localCandidateId"))
+            .ok().and_then(|v| v.as_string()).unwrap_or_default();
+        let remote_id = Reflect::get(&report, &JsValue::from_str("remoteCandidateId"))
+            .ok().and_then(|v| v.as_string()).unwrap_or_default();
+        let rtt = Reflect::get(&report, &JsValue::from_str("currentRoundTripTime"))
+            .ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+        let local_info = local_candidates.get(&local_id).map(|s| s.as_str()).unwrap_or("unknown");
+        let remote_info = remote_candidates.get(&remote_id).map(|s| s.as_str()).unwrap_or("unknown");
+
+        info!(
+            "[ICE] peer={} selected_pair: local=[{}], remote=[{}], state={}, rtt={:.2}ms",
+            peer_id, local_info, remote_info, state_str, rtt * 1000.0
+        );
+    }
 }
 
 async fn wait_for_ice_gathering_complete(peer_id: PeerId, conn: Arc<RtcConnectionWrapper>, timeout: Duration, ensure_relay: bool) -> Result<bool, PeerError> {
