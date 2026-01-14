@@ -1096,7 +1096,7 @@ async fn create_rtc_peer_connection(
         info!("Creating peer connection with relay-only ICE transport policy");
         RTCIceTransportPolicy::Relay
     } else {
-        RTCIceTransportPolicy::Relay
+        RTCIceTransportPolicy::All
     };
 
     let config = RTCConfiguration {
