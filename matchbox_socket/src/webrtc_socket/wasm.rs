@@ -305,8 +305,6 @@ impl Messenger for WasmMessenger {
         ice_server_config: RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
         timeout: Duration,
-        _relay_fallback_on_timeout: bool,
-        _relay_retry_timeout: Duration,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
         debug!("making offer");
         log::info!("Using ice config {:?}", ice_server_config);
@@ -425,8 +423,6 @@ impl Messenger for WasmMessenger {
         ice_server_config: &RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
         timeout: Duration,
-        _relay_fallback_on_timeout: bool,
-        _relay_retry_timeout: Duration,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError> {
         debug!("handshake_accept");
 
@@ -706,11 +702,6 @@ fn create_rtc_peer_connection(peer_id: &PeerId, ice_server_config: &RtcIceServer
     oniceconnectionstatechange.forget();
 
     Ok(connection)
-}
-
-/// Check if an ICE candidate is a relay (TURN) candidate.
-fn is_relay_candidate(candidate: &str) -> bool {
-    candidate.contains("typ relay")
 }
 
 fn parse_candidate_type(candidate: &str) -> &'static str {

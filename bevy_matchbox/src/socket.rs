@@ -18,7 +18,7 @@ use std::{
 ///
 /// fn open_socket_system(mut commands: Commands) {
 ///     let room_url = "wss://matchbox.example.com";
-///     let builder = WebRtcSocketBuilder::new(room_url).add_channel(ChannelConfig::reliable());
+///     let builder = WebRtcSocketBuilder::new(room_url).add_channel(ChannelConfig::reliable(None));
 ///     commands.spawn(MatchboxSocket::from(builder));
 /// }
 ///
@@ -38,7 +38,7 @@ use std::{
 ///
 /// fn open_socket_system(mut commands: Commands) {
 ///     let room_url = "wss://matchbox.example.com";
-///     commands.open_socket(WebRtcSocketBuilder::new(room_url).add_channel(ChannelConfig::reliable()));
+///     commands.open_socket(WebRtcSocketBuilder::new(room_url).add_channel(ChannelConfig::reliable(None)));
 /// }
 ///
 /// fn close_socket_system(mut commands: Commands) {
@@ -55,7 +55,7 @@ use std::{
 ///     let room_url = "wss://matchbox.example.com";
 ///
 ///     let socket: MatchboxSocket = WebRtcSocketBuilder::new(room_url)
-///         .add_channel(ChannelConfig::reliable())
+///         .add_channel(ChannelConfig::reliable(None))
 ///         .into();
 ///
 ///     commands.insert_resource(socket);

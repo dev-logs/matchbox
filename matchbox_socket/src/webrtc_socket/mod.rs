@@ -177,8 +177,6 @@ trait Messenger {
         ice_server_config: RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
         timeout: Duration,
-        relay_fallback_on_timeout: bool,
-        relay_retry_timeout: Duration,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError>;
 
     async fn accept_handshake(
@@ -188,8 +186,6 @@ trait Messenger {
         ice_server_config: &RtcIceServerConfig,
         channel_configs: &[ChannelConfig],
         timeout: Duration,
-        relay_fallback_on_timeout: bool,
-        relay_retry_timeout: Duration,
     ) -> Result<HandshakeResult<Self::DataChannel, Self::HandshakeMeta>, PeerError>;
 
     async fn peer_loop(peer_uuid: PeerId, handshake_meta: Self::HandshakeMeta) -> PeerId;
@@ -202,8 +198,6 @@ async fn message_loop<M: Messenger>(
     channels: MessageLoopChannels,
     keep_alive_interval: Option<Duration>,
     handshake_timeout: Duration,
-    relay_fallback_on_timeout: bool,
-    relay_retry_timeout: Duration,
 ) -> Result<(), SignalingError> {
     let MessageLoopChannels {
         requests_sender,
@@ -266,7 +260,7 @@ async fn message_loop<M: Messenger>(
 
                             // Merge ice configs if event contains config, otherwise clone the base config
                             let merged_config = ice_config.unwrap_or(ice_server_config.clone());
-                            handshakes.push(M::offer_handshake(signal_peer, signal_rx, messages_from_peers_tx.clone(), merged_config, channel_configs, handshake_timeout.clone(), relay_fallback_on_timeout, relay_retry_timeout))
+                            handshakes.push(M::offer_handshake(signal_peer, signal_rx, messages_from_peers_tx.clone(), merged_config, channel_configs, handshake_timeout.clone()))
                         },
                         PeerEvent::PeerLeft(peer_uuid) => {
                             if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected, None)).is_err() {
@@ -282,7 +276,7 @@ async fn message_loop<M: Messenger>(
                             let signal_tx = handshake_signals.entry(sender).or_insert_with(|| {
                                 let (from_peer_tx, peer_signal_rx) = futures_channel::mpsc::unbounded();
                                 let signal_peer = SignalPeer::new(sender, requests_sender.clone());
-                                handshakes.push(M::accept_handshake(signal_peer, peer_signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs, handshake_timeout.clone(), relay_fallback_on_timeout, relay_retry_timeout));
+                                handshakes.push(M::accept_handshake(signal_peer, peer_signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs, handshake_timeout.clone()));
                                 from_peer_tx
                             });
 

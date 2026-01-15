@@ -84,10 +84,6 @@ pub(crate) struct SocketConfig {
     pub(crate) keep_alive_interval: Option<Duration>,
     /// Timeout for peer handshake
     pub(crate) webrtc_handshake_timeout: Duration,
-    /// Whether to retry with relay-only mode when data channel connection times out
-    pub(crate) relay_fallback_on_timeout: bool,
-    /// Timeout for relay retry attempt (shorter than main handshake timeout)
-    pub(crate) relay_retry_timeout: Duration,
 }
 
 /// Builder for [`WebRtcSocket`]s.
@@ -116,8 +112,6 @@ impl WebRtcSocketBuilder {
                 attempts: Some(3),
                 keep_alive_interval: Some(Duration::from_secs(10)),
                 webrtc_handshake_timeout: Duration::from_secs(30),
-                relay_fallback_on_timeout: false,
-                relay_retry_timeout: Duration::from_secs(15),
             },
             signaller_builder: None,
         }
@@ -178,37 +172,6 @@ impl WebRtcSocketBuilder {
     /// Timeout for peer handshake
     pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
         self.config.webrtc_handshake_timeout = timeout;
-        self
-    }
-
-    /// Enable automatic retry with relay-only mode when data channel connection times out.
-    ///
-    /// When enabled, if the initial peer connection fails to establish data channels
-    /// within the timeout, the system will:
-    /// 1. Close the failed connection
-    /// 2. Signal the peer to retry with relay-only mode
-    /// 3. Create a new connection with `ice_transport_policy: Relay`
-    /// 4. Complete handshake using only TURN relay candidates
-    ///
-    /// **Requirements:**
-    /// - TURN servers must be configured via [`WebRtcSocketBuilder::ice_server`]
-    /// - Both peers should use compatible versions that support `RetryWithRelay` signal
-    ///
-    /// Default: `false`
-    pub fn relay_fallback_on_timeout(mut self, enable: bool) -> Self {
-        self.config.relay_fallback_on_timeout = enable;
-        self
-    }
-
-    /// Set timeout for relay retry attempt.
-    ///
-    /// This timeout applies only to the relay fallback attempt, not the initial
-    /// connection attempt. A shorter timeout is recommended since relay connections
-    /// should establish quickly if TURN servers are properly configured.
-    ///
-    /// Default: 15 seconds
-    pub fn relay_retry_timeout(mut self, timeout: Duration) -> Self {
-        self.config.relay_retry_timeout = timeout;
         self
     }
 
@@ -668,8 +631,8 @@ impl WebRtcSocket {
     /// use matchbox_socket::*;
     ///
     /// let (mut socket, message_loop) = WebRtcSocketBuilder::new("wss://example.invalid/")
-    ///     .add_channel(ChannelConfig::reliable())
-    ///     .add_channel(ChannelConfig::unreliable())
+    ///     .add_channel(ChannelConfig::reliable(None))
+    ///     .add_channel(ChannelConfig::unreliable(None))
     ///     .build();
     /// let is_closed = socket.channel(0).is_closed();
     /// ```
@@ -690,8 +653,8 @@ impl WebRtcSocket {
     /// use matchbox_socket::*;
     ///
     /// let (mut socket, message_loop) = WebRtcSocketBuilder::new("wss://example.invalid/")
-    ///     .add_channel(ChannelConfig::reliable())
-    ///     .add_channel(ChannelConfig::unreliable())
+    ///     .add_channel(ChannelConfig::reliable(None))
+    ///     .add_channel(ChannelConfig::unreliable(None))
     ///     .build();
     /// let reliable_channel_messages = socket.channel_mut(0).receive();
     /// ```
@@ -714,8 +677,8 @@ impl WebRtcSocket {
     /// use matchbox_socket::*;
     ///
     /// let (mut socket, message_loop) = WebRtcSocketBuilder::new("wss://example.invalid/")
-    ///     .add_channel(ChannelConfig::reliable())
-    ///     .add_channel(ChannelConfig::unreliable())
+    ///     .add_channel(ChannelConfig::reliable(None))
+    ///     .add_channel(ChannelConfig::unreliable(None))
     ///     .build();
     /// let is_closed = socket.get_channel(0).unwrap().is_closed();
     /// ```
@@ -737,8 +700,8 @@ impl WebRtcSocket {
     /// use matchbox_socket::*;
     ///
     /// let (mut socket, message_loop) = WebRtcSocketBuilder::new("wss://example.invalid/")
-    ///     .add_channel(ChannelConfig::reliable())
-    ///     .add_channel(ChannelConfig::unreliable())
+    ///     .add_channel(ChannelConfig::reliable(None))
+    ///     .add_channel(ChannelConfig::unreliable(None))
     ///     .build();
     /// let reliable_channel_messages = socket.get_channel_mut(0).unwrap().receive();
     /// ```
@@ -758,8 +721,8 @@ impl WebRtcSocket {
     /// use matchbox_socket::*;
     ///
     /// let (mut socket, message_loop) = WebRtcSocketBuilder::new("wss://example.invalid/")
-    ///     .add_channel(ChannelConfig::reliable())
-    ///     .add_channel(ChannelConfig::unreliable())
+    ///     .add_channel(ChannelConfig::reliable(None))
+    ///     .add_channel(ChannelConfig::unreliable(None))
     ///     .build();
     /// let reliable_channel = socket.take_channel(0).unwrap();
     /// let unreliable_channel = socket.take_channel(1).unwrap();
@@ -886,8 +849,6 @@ async fn run_socket(
         channels,
         config.keep_alive_interval,
         config.webrtc_handshake_timeout,
-        config.relay_fallback_on_timeout,
-        config.relay_retry_timeout,
     );
 
     let mut message_loop_done = Box::pin(message_loop_fut.fuse());
