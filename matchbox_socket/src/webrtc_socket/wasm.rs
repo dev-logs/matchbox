@@ -20,7 +20,7 @@ use wasm_bindgen::{JsCast, JsValue, convert::FromWasmAbi, prelude::*};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Event, MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelInit, RtcDataChannelType, RtcIceCandidateInit, RtcIceConnectionState, RtcIceGatheringState, RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit, RtcStatsReport, RtcStatsReportInternal};
 use ws_stream_wasm::{WsMessage, WsMeta, WsStream};
-use crate::webrtc_socket::batch::Batch;
+use crate::webrtc_socket::batch::BatchReceiver;
 use crate::webrtc_socket::error::PeerError;
 
 pub(crate) struct WasmSignaller {
@@ -922,7 +922,11 @@ fn create_data_channel(
     );
 
     let is_reliable = channel.reliable();
-    let mut current_batch = None;
+    let mut batch_receiver = if is_reliable {
+        Some(BatchReceiver::new(30000.0))
+    } else {
+        None
+    };
     leaking_channel_event_handler(
         |f| channel.set_onmessage(f),
         move |event: MessageEvent| {
@@ -930,27 +934,18 @@ fn create_data_channel(
             if let Ok(arraybuf) = event.data().dyn_into::<js_sys::ArrayBuffer>() {
                 let uarray = js_sys::Uint8Array::new(&arraybuf);
                 let body = uarray.to_vec();
-                if let Some(batch) = if !is_reliable { None } else {
-                    Batch::from_bytes(&body, &peer_id)
-                } {
-                    current_batch.replace(batch);
-                    return;
-                }
 
-                let packet = if let Some(batch) = current_batch.as_mut() {
-                    if batch.full_fill(&body) {
-                       current_batch.take().map(|it| it.into_packet()).unwrap_or_default()
+                let packet = if let Some(ref mut receiver) = batch_receiver {
+                    let now_ms = js_sys::Date::now();
+                    match receiver.receive_packet(&body, &peer_id, now_ms) {
+                        Some(p) => p,
+                        None => return,
                     }
-                    else {
-                        return;
-                    }
-                }
-                else {
+                } else {
                     body.into_boxed_slice()
                 };
 
                 if let Err(e) = incoming_tx.unbounded_send((peer_id, packet)) {
-                    // should only happen if the socket is dropped, or we are out of memory
                     warn!("failed to notify about data channel message: {e:?}");
                 }
             }

@@ -41,7 +41,8 @@ use webrtc::api::setting_engine::SettingEngine;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::ice::network_type::NetworkType;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
-use crate::webrtc_socket::batch::Batch;
+use crate::webrtc_socket::batch::BatchReceiver;
+use std::time::{SystemTime, UNIX_EPOCH};
 use crate::webrtc_socket::error::PeerError;
 
 impl From<webrtc::Error> for SignalingError {
@@ -1049,29 +1050,29 @@ async fn create_data_channel(
         }));
     }
 
-    let mut current_batch = None::<Batch>;
-    let is_reliable = channel_config.ordered &&
-        channel_config.max_retransmits.is_none();
+    let is_reliable = channel_config.ordered && channel_config.max_retransmits.is_none();
+    let mut batch_receiver = if is_reliable {
+        Some(BatchReceiver::new(30000.0))
+    } else {
+        None
+    };
     channel.on_message(Box::new(move |message| {
-        let mut packet: Packet = (*message.data).into();
-        if let Some(batch) = if !is_reliable { None } else {
-            Batch::from_bytes(&packet, &peer_id)
-        } {
-            current_batch.replace(batch);
-            return Box::pin(async move {});
-        }
+        let data: Packet = (*message.data).into();
 
-        if let Some(batch) = current_batch.as_mut() {
-            if batch.full_fill(&packet) {
-                packet = current_batch.take().map(|it| it.into_packet()).unwrap_or_default();
+        let packet = if let Some(ref mut receiver) = batch_receiver {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as f64)
+                .unwrap_or(0.0);
+            match receiver.receive_packet(&data, &peer_id, now_ms) {
+                Some(p) => p,
+                None => return Box::pin(async move {}),
             }
-            else {
-                return Box::pin(async move {});
-            }
+        } else {
+            data
         };
 
         if let Err(e) = from_peer_message_tx.unbounded_send((peer_id, packet)) {
-            // should only happen if the socket is dropped, or we are out of memory
             warn!("failed to notify about data channel message: {e:?}");
         }
 

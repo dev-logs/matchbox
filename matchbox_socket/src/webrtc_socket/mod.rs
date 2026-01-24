@@ -21,7 +21,7 @@ pub use socket::{
     ChannelConfig, PeerState, RtcIceServerConfig, WebRtcChannel, WebRtcSocket, WebRtcSocketBuilder,
 };
 use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
-use crate::webrtc_socket::batch::Batch;
+use crate::webrtc_socket::batch::{Batch, BatchSendResult};
 use crate::webrtc_socket::error::PeerError;
 
 pub static MAX_PACKET_SIZE: usize = 1024 * 63;
@@ -338,11 +338,18 @@ async fn message_loop<M: Messenger>(
                         };
 
                         if packet.len() > MAX_PACKET_SIZE && data_channel.is_reliable() {
-                            log::info!("Packet {} too large, will split into batches", packet.len());
-                            let _ = data_channel.send(Batch::new(peer, packet.len()).as_bytes());
-                            packet.chunks(MAX_PACKET_SIZE).for_each(|chunk| {
-                                let _ = data_channel.send(chunk.into());
-                            })
+                            log::info!("Packet {} bytes too large, splitting into batches", packet.len());
+                            match Batch::send_chunked(&packet, peer, data_channel) {
+                                BatchSendResult::Success => {
+                                    log::info!("Batch sent successfully to peer {peer}");
+                                }
+                                BatchSendResult::HeaderFailure { error } => {
+                                    log::info!("Failed to send batch header to peer {peer}: {error}");
+                                }
+                                BatchSendResult::PartialFailure { sent, total, error } => {
+                                    log::info!("Batch send to peer {peer} failed after {sent}/{total} chunks: {error}");
+                                }
+                            }
                         }
                         else {
                             if let Err(e) = data_channel.send(packet) {
