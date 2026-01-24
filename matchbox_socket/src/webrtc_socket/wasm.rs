@@ -932,10 +932,10 @@ fn create_data_channel(
     leaking_channel_event_handler(
         |f| channel.set_onmessage(f),
         move |event: MessageEvent| {
-            trace!("data channel message received {event:?}");
             if let Ok(arraybuf) = event.data().dyn_into::<js_sys::ArrayBuffer>() {
                 let uarray = js_sys::Uint8Array::new(&arraybuf);
                 let body = uarray.to_vec();
+                log::info!("WASM received {} bytes from peer {peer_id}, batch_receiver={}", body.len(), batch_receiver.is_some());
 
                 let packet = if let Some(ref mut receiver) = batch_receiver {
                     let now_ms = js_sys::Date::now();
