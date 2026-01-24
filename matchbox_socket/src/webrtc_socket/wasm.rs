@@ -921,7 +921,9 @@ fn create_data_channel(
         },
     );
 
-    let is_reliable = channel.reliable();
+    let is_reliable = channel_config.ordered && channel_config.max_retransmits.is_none();
+    log::info!("Data channel {channel_id} is_reliable={is_reliable} (ordered={}, max_retransmits={:?})",
+        channel_config.ordered, channel_config.max_retransmits);
     let mut batch_receiver = if is_reliable {
         Some(BatchReceiver::new(30000.0))
     } else {
